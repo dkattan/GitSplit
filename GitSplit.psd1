@@ -1,6 +1,6 @@
 @{
   RootModule        = 'GitSplit.psm1'
-  ModuleVersion     = '0.1.0'
+  ModuleVersion     = '0.1.1'
   GUID              = '7f9e2f0f-3e87-4cf0-9aa6-e1121916ff4e'
   Author            = 'Darren Kattan'
   CompanyName       = ''
@@ -30,3 +30,4 @@
     }
   }
 }
+
