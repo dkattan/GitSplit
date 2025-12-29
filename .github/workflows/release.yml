@@ -16,7 +16,9 @@ jobs:
     # (Depending on how the push was created, github.actor can be misleading.)
     if: >-
       github.event.head_commit.author.username == 'github-actions[bot]' ||
+      github.event.head_commit.author.name == 'github-actions[bot]' ||
       github.event.head_commit.committer.username == 'github-actions[bot]' ||
+      github.event.head_commit.committer.name == 'github-actions[bot]' ||
       github.event.pusher.name == 'github-actions[bot]'
 
     steps:
