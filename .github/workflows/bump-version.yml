@@ -74,3 +74,10 @@ jobs:
           git add GitSplit.psd1
           git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
           git push
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.new_version }}
+          name: v${{ steps.bump.outputs.new_version }}
+          generate_release_notes: true
