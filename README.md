@@ -79,8 +79,9 @@ Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI
 
 Publishing is handled by GitHub Actions:
 
-- CI runs Pester on pushes and PRs.
-- Publishing runs on version tags like `v0.1.0` and publishes to the PowerShell Gallery.
+- CI runs Pester on PRs.
+- On every push to `main`, a workflow runs Pester, bumps the patch version in `GitSplit.psd1`, commits it, and creates a GitHub Release.
+- Publishing runs when the GitHub Release is published and publishes to the PowerShell Gallery.
 
 You’ll need a repository secret:
 

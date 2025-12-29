@@ -1,9 +1,11 @@
 name: Publish to PowerShell Gallery
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -58,11 +60,7 @@ jobs:
 
           $manifest = Import-PowerShellDataFile -Path $manifestPath
           $version = [string]$manifest.ModuleVersion
-
-          $tag = ($env:GITHUB_REF -replace '^refs/tags/', '')
-          if ($tag -ne "v$version") {
-            throw "Tag '$tag' must match manifest ModuleVersion 'v$version'"
-          }
+          Write-Host "Publishing $moduleName version $version" -ForegroundColor Cyan
 
           # Publish-Module expects the module in a folder named after the module.
           $stagingRoot = Join-Path $env:RUNNER_TEMP 'psgallery'

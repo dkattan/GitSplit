@@ -3,12 +3,18 @@ name: CI
 on:
   push:
     branches: [ "**" ]
+    paths-ignore:
+      - 'GitSplit.psd1'
   pull_request:
 
 jobs:
   test:
     name: Pester
     runs-on: ubuntu-latest
+
+    # If the release workflow bumps the version and commits it, we don't want CI to run twice.
+    # (We still run tests in the release/publish pipelines.)
+    if: github.actor != 'github-actions[bot]'
 
     steps:
       - name: Checkout
