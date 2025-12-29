@@ -148,9 +148,10 @@ function Split-Hunk {
   }
 
   $oldStart = [int]$matches[1]
-  $oldCount = if ($matches[2]) { [int]$matches[2] } else { 1 }
   $newStart = [int]$matches[3]
-  $newCount = if ($matches[4]) { [int]$matches[4] } else { 1 }
+
+  # Note: we intentionally don't use the original header counts here; we recompute
+  # old/new counts from the body lines when building the split hunks.
 
   $bodyText = if ($firstNl -ge 0 -and $firstNl -lt ($text.Length - 1)) { $text.Substring($firstNl + 1) } else { '' }
   $body = @()
@@ -1016,4 +1017,229 @@ function Add-Commit {
   }
 }
 
-Export-ModuleMember -Function Split-Patch, Split-Hunk, New-Hunk, New-Range, Split-Commit, Add-Commit
+function Move-Commit {
+  <#
+  .SYNOPSIS
+  Moves (or copies) a commit from the current branch to another branch.
+
+  .DESCRIPTION
+  Applies a commit to a destination branch via cherry-pick.
+
+  To avoid disrupting the caller's working directory, this function uses a temporary
+  `git worktree` for the destination branch, so it does NOT need to checkout/switch
+  branches in the current working tree.
+
+  Optionally, the commit can be removed from the current branch (history rewrite).
+  Removing a non-HEAD commit requires a rebase operation and therefore assumes the
+  current branch contains the commit and that you are okay with rewriting history.
+
+  .PARAMETER CommitRef
+  Commit-ish to move/copy. Defaults to HEAD.
+
+  .PARAMETER DestinationBranch
+  The destination branch to receive the commit. Must exist locally or on origin.
+
+  .PARAMETER RemoveFromSource
+  If specified, removes the commit from the current branch after applying it to the destination.
+  This rewrites history.
+
+  .PARAMETER Push
+  If specified, pushes the destination branch (and source branch if RemoveFromSource) to origin.
+
+  .PARAMETER ForcePushSource
+  If specified and RemoveFromSource is set, force-pushes the rewritten source branch.
+
+  .PARAMETER AutoStash
+  If specified, stashes uncommitted changes at the start and restores them at the end.
+  Without AutoStash, the working tree must be clean.
+
+  .OUTPUTS
+  System.String
+  The destination branch name.
+
+  .NOTES
+  This command can rewrite history when -RemoveFromSource is specified.
+  Prefer using on local/unpublished branches (or be prepared to force push).
+  #>
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  [OutputType([string])]
+  param(
+    [Parameter(Position = 0)]
+    [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
+    [string]$CommitRef = "HEAD",
+
+    [Parameter(Position = 1, Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$DestinationBranch,
+
+    [Parameter()]
+    [switch]$RemoveFromSource,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePushSource,
+
+    [Parameter()]
+    [switch]$AutoStash
+  )
+
+  $repoRoot = (git rev-parse --show-toplevel)
+  if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
+    throw "Move-Commit must be run inside a git repository."
+  }
+
+  $stashed = $false
+  $stashName = $null
+  $destWorktreePath = $null
+
+  try {
+    # Ensure worktree safety. A dirty tree can make destructive operations risky.
+    $status = (git status --porcelain)
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to determine git status."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+      if (-not $AutoStash) {
+        throw "Uncommitted changes detected. Re-run with -AutoStash, or commit/stash your changes before calling Move-Commit."
+      }
+
+      $stashName = "gitsplit-move-commit-$(Get-Date -Format 'yyyyMMddHHmmss')"
+      git stash push -u -m $stashName | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "Failed to stash changes."
+      }
+      $stashed = $true
+    }
+
+    $currentBranch = (git rev-parse --abbrev-ref HEAD)
+    if ($LASTEXITCODE -ne 0 -or -not $currentBranch) {
+      throw "Failed to get current branch."
+    }
+    $currentBranch = $currentBranch.Trim()
+    if ($currentBranch -eq 'HEAD') {
+      throw "You are in a detached HEAD state. Checkout a branch before calling Move-Commit."
+    }
+
+    # Resolve commit hash.
+    $commitHash = (git rev-parse $CommitRef)
+    if ($LASTEXITCODE -ne 0 -or -not $commitHash) {
+      throw "Failed to resolve commit reference '$CommitRef'."
+    }
+    $commitHash = $commitHash.Trim()
+
+    # Verify destination branch exists locally or on origin.
+    $branchExists = $true
+    git show-ref --verify --quiet "refs/heads/$DestinationBranch" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $branchExists = $false
+    }
+    $remoteBranchExists = $true
+    git show-ref --verify --quiet "refs/remotes/origin/$DestinationBranch" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $remoteBranchExists = $false
+    }
+    if (-not $branchExists -and -not $remoteBranchExists) {
+      throw "Destination branch '$DestinationBranch' does not exist locally or on origin. Create it first."
+    }
+
+    # Create a temporary worktree for destination branch so we don't have to switch.
+    $wtRoot = Join-Path $repoRoot '.gitsplit-worktrees'
+    if (-not (Test-Path -LiteralPath $wtRoot)) {
+      New-Item -Path $wtRoot -ItemType Directory -Force | Out-Null
+    }
+    $destWorktreePath = Join-Path $wtRoot ([guid]::NewGuid().ToString())
+
+    if ($PSCmdlet.ShouldProcess("$DestinationBranch", "Cherry-pick $commitHash")) {
+      if ($remoteBranchExists -and -not $branchExists) {
+        # Create a local branch from origin in the worktree.
+        git worktree add -b $DestinationBranch $destWorktreePath "origin/$DestinationBranch" | Out-Null
+      }
+      else {
+        git worktree add $destWorktreePath $DestinationBranch | Out-Null
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "Failed to add worktree for destination branch '$DestinationBranch'."
+      }
+
+      # Apply commit to destination.
+      git -C $destWorktreePath cherry-pick $commitHash | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "Failed to cherry-pick commit $commitHash onto '$DestinationBranch'. Resolve conflicts in worktree '$destWorktreePath' and run 'git -C <path> cherry-pick --continue' or '--abort'."
+      }
+
+      if ($Push) {
+        git -C $destWorktreePath push -u origin $DestinationBranch | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Failed to push destination branch '$DestinationBranch' to origin."
+        }
+      }
+    }
+
+    if ($RemoveFromSource) {
+      # Ensure the commit is on the current branch.
+      git merge-base --is-ancestor $commitHash HEAD | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "Commit $commitHash is not an ancestor of current branch '$currentBranch'. Move-Commit can only remove commits from the current branch."
+      }
+
+      $headHash = (git rev-parse HEAD).Trim()
+      if ($headHash -eq $commitHash) {
+        # Remove latest commit.
+        if ($PSCmdlet.ShouldProcess($currentBranch, "Remove HEAD commit (reset --hard HEAD~1)")) {
+          git reset --hard HEAD~1 | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to reset and remove HEAD commit from '$currentBranch'."
+          }
+        }
+      }
+      else {
+        # Remove non-HEAD commit by rebasing commits after it onto its parent.
+        git rev-parse --verify "$commitHash^" 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Cannot remove the initial commit via rebase."
+        }
+
+        if ($PSCmdlet.ShouldProcess($currentBranch, "Remove commit via rebase --onto")) {
+          git rebase --onto "$commitHash^" $commitHash HEAD | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to rebase and remove commit $commitHash from '$currentBranch'. Resolve conflicts and run 'git rebase --continue' or abort with 'git rebase --abort'."
+          }
+        }
+      }
+
+      if ($Push) {
+        if ($ForcePushSource) {
+          git push --force-with-lease origin $currentBranch | Out-Null
+        }
+        else {
+          git push origin $currentBranch | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+          throw "Failed to push updated source branch '$currentBranch' to origin."
+        }
+      }
+    }
+
+    return $DestinationBranch
+  }
+  finally {
+    # Best-effort cleanup: remove worktree.
+    if ($destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
+      git worktree remove --force $destWorktreePath 2>$null | Out-Null
+    }
+
+    if ($stashed) {
+      # Try to re-apply the stash created by this function.
+      # Use pop so we don't leak stashes.
+      git stash list | Select-String -SimpleMatch $stashName | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        git stash pop | Out-Null
+      }
+    }
+  }
+}
+
+
+Export-ModuleMember -Function Split-Patch, Split-Hunk, New-Hunk, New-Range, Split-Commit, Add-Commit, Move-Commit

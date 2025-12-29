@@ -21,11 +21,11 @@
   VariablesToExport = @()
   AliasesToExport   = @()
 
-  PrivateData = @{
+  PrivateData       = @{
     PSData = @{
-      Tags       = @('git', 'diff', 'patch', 'hunk', 'pester')
-      LicenseUri = 'https://opensource.org/license/mit/'
-      ProjectUri = 'https://github.com/dkattan/GitSplit'
+      Tags         = @('git', 'diff', 'patch', 'hunk', 'pester')
+      LicenseUri   = 'https://opensource.org/license/mit/'
+      ProjectUri   = 'https://github.com/dkattan/GitSplit'
       ReleaseNotes = 'Initial release.'
     }
   }

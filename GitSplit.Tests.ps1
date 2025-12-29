@@ -291,4 +291,115 @@ Describe "GitSplit" {
     }
   }
 
+  Describe "Move-Commit" {
+    It "cherry-picks HEAD to another branch without switching the current branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $sourceBranch | Should -Not -Be 'HEAD'
+
+        # Create destination branch from current HEAD (so it exists locally and shares history)
+        git branch dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Create a new commit on source
+        'extra-line' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        $msg = "Extra change on source $(New-Guid)"
+        git commit -m $msg | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Call Move-Commit without Push/RemoveFromSource
+        $result = Move-Commit -CommitRef HEAD -DestinationBranch 'dest'
+        $result | Should -Be 'dest'
+
+        # We should still be on the original branch
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+
+        # Destination branch should now contain the commit (SHA changes on cherry-pick, so match by subject)
+        $destSubjects = (git log dest -n 50 --pretty=format:%s) -join "`n"
+        $destSubjects | Should -Match ([regex]::Escape($msg))
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "can move HEAD~1 to another branch and remove it from the source branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        git branch dest2 | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Create TWO commits on source so HEAD~1 exists and is non-HEAD.
+        'extra-line-2' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+        $msgToMove = "Extra change to MOVE $(New-Guid)"
+        git commit -m $msgToMove | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'extra-line-3' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        $msgToKeep = "Extra change to KEEP $(New-Guid)"
+        git commit -m $msgToKeep | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Move the *previous* commit (non-HEAD) to dest2 and remove it from source.
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'dest2' -RemoveFromSource | Out-Null
+
+        # Source branch should no longer contain the moved commit subject,
+        # but should still contain the later commit subject.
+        $sourceSubjects = (git log -n 50 --pretty=format:%s) -join "`n"
+        $sourceSubjects | Should -Not -Match ([regex]::Escape($msgToMove))
+        $sourceSubjects | Should -Match ([regex]::Escape($msgToKeep))
+
+        # Destination should contain the moved commit.
+        $destSubjects = (git log dest2 -n 50 --pretty=format:%s) -join "`n"
+        $destSubjects | Should -Match ([regex]::Escape($msgToMove))
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-CommitMessageFromChanges" {
+    It "returns null when there are no changes" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Ensure clean working tree
+        git reset --hard | Out-Null
+        git clean -fd | Out-Null
+
+        $msg = Get-CommitMessageFromChanges -DiffLevel Summary
+        $msg | Should -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when Anthropic key is not set" {
+      Push-Location $script:TempRepoPath
+      try {
+        $oldAnthropicKey = $env:AnthropicKey
+        $oldAnthropicToken = $env:ANTHROPIC_TOKEN
+        $env:AnthropicKey = $null
+        $env:ANTHROPIC_TOKEN = $null
+
+        'local-change' | Add-Content -Path 'a.txt'
+
+        { Get-CommitMessageFromChanges -DiffLevel None } | Should -Throw
+
+        # Cleanup
+        git checkout -- a.txt | Out-Null
+      }
+      finally {
+        $env:AnthropicKey = $oldAnthropicKey
+        $env:ANTHROPIC_TOKEN = $oldAnthropicToken
+        Pop-Location
+      }
+    }
+  }
+
 }
