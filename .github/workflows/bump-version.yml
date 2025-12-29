@@ -1,0 +1,76 @@
+name: Bump Version
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: Set ModuleVersion and push
+    runs-on: ubuntu-latest
+
+    # Only run for human (or non-actions) pushes; this job creates the bot commit.
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI -Output Detailed
+
+      - name: Set module version (date-based)
+        id: bump
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $moduleName = 'GitSplit'
+          $manifestPath = Join-Path $PWD "$moduleName.psd1"
+          if (-not (Test-Path $manifestPath)) { throw "Manifest not found at $manifestPath" }
+
+          $date = (Get-Date).ToUniversalTime().ToString('yyyy.MM.dd')
+          $runNumber = [int]'${{ github.run_number }}'
+          $new = "$date.$runNumber"
+
+          $content = Get-Content -LiteralPath $manifestPath -Raw
+          $content2 = [regex]::Replace(
+            $content,
+            "(?m)^\s*ModuleVersion\s*=\s*'[^']*'\s*$",
+            "  ModuleVersion     = '$new'"
+          )
+          if ($content2 -eq $content) {
+            throw 'Failed to update ModuleVersion line in manifest (unexpected format).'
+          }
+
+          Set-Content -LiteralPath $manifestPath -Value $content2 -Encoding utf8
+          "new_version=$new" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Commit version bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add GitSplit.psd1
+          git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
+          git push

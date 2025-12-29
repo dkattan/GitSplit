@@ -8,12 +8,12 @@ permissions:
   contents: write
 
 jobs:
-  bump_and_release:
-    name: Bump version and create release
+  release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
 
-    # Prevent infinite loop when this workflow pushes the bump commit.
-    if: github.actor != 'github-actions[bot]'
+    # Only run on the bot commit created by the bump workflow.
+    if: github.actor == 'github-actions[bot]'
 
     steps:
       - name: Checkout
@@ -35,8 +35,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI -Output Detailed
 
-      - name: Set module version (date-based)
-        id: bump
+      - name: Read version from manifest
+        id: version
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
@@ -46,46 +46,19 @@ jobs:
           $manifestPath = Join-Path $PWD "$moduleName.psd1"
           if (-not (Test-Path $manifestPath)) { throw "Manifest not found at $manifestPath" }
 
-          # Date-based version format: yyyy.MM.dd.<github.run_number>
-          # - yyyy.MM.dd is in UTC (stable across runners)
-          # - github.run_number is a monotonically increasing integer per workflow in the repository
-          $date = (Get-Date).ToUniversalTime().ToString('yyyy.MM.dd')
-          $runNumber = [int]'${{ github.run_number }}'
-          $new = "$date.$runNumber"
+          $manifest = Import-PowerShellDataFile -Path $manifestPath
+          $v = [string]$manifest.ModuleVersion
+          if (-not $v) { throw 'ModuleVersion not found in manifest.' }
 
-          $content = Get-Content -LiteralPath $manifestPath -Raw
-          $content2 = [regex]::Replace(
-            $content,
-            "(?m)^\s*ModuleVersion\s*=\s*'[^']*'\s*$",
-            "  ModuleVersion     = '$new'"
-          )
-          if ($content2 -eq $content) {
-            throw 'Failed to update ModuleVersion line in manifest (unexpected format).'
-          }
-
-          Set-Content -LiteralPath $manifestPath -Value $content2 -Encoding utf8
-
-          "new_version=$new" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Commit version bump
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add GitSplit.psd1
-          git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
-          git push
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.bump.outputs.new_version }}
-          name: v${{ steps.bump.outputs.new_version }}
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
           body: |
-            Automated release for version v${{ steps.bump.outputs.new_version }}.
+            Automated release for version v${{ steps.version.outputs.version }}.
             
             Changes:
             - See commit history for details.
