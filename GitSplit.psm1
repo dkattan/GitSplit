@@ -1242,4 +1242,4 @@ function Move-Commit {
 }
 
 
-Export-ModuleMember -Function Split-Patch, Split-Hunk, New-Hunk, New-Range, Split-Commit, Add-Commit, Move-Commit
+Export-ModuleMember -Function Split-Commit, Add-Commit
