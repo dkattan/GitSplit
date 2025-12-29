@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+
+jobs:
+  test:
+    name: Pester
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # Use Pester v5+ explicitly.
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI -Output Detailed

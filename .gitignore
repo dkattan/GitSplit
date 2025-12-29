@@ -1,0 +1,8 @@
+# PowerShell / Pester
+/testResults.xml
+
+# Test artifacts
+/temprepo/
+
+# OS
+.DS_Store

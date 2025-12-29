@@ -1,0 +1,11 @@
+diff --git a/b.txt b/b.txt
+index 1111111..2222222 100644
+--- a/b.txt
++++ b/b.txt
+@@ -1,4 +1,5 @@
+ b-line-1
+-b-line-2 (edited)
++b-line-2 (edited again)
+ b-line-3
+ b-line-4 (new)
++b-line-5 (new in commit 3)
