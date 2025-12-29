@@ -12,8 +12,12 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
 
-    # Only run on the bot commit created by the bump workflow.
-    if: github.actor == 'github-actions[bot]'
+    # Only run when the HEAD commit was authored/committed by the GitHub Actions bot.
+    # (Depending on how the push was created, github.actor can be misleading.)
+    if: >-
+      github.event.head_commit.author.username == 'github-actions[bot]' ||
+      github.event.head_commit.committer.username == 'github-actions[bot]' ||
+      github.event.pusher.name == 'github-actions[bot]'
 
     steps:
       - name: Checkout
