@@ -35,7 +35,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI -Output Detailed
 
-      - name: Bump module version (patch)
+      - name: Set module version (date-based)
         id: bump
         shell: pwsh
         run: |
@@ -46,9 +46,12 @@ jobs:
           $manifestPath = Join-Path $PWD "$moduleName.psd1"
           if (-not (Test-Path $manifestPath)) { throw "Manifest not found at $manifestPath" }
 
-          $manifest = Import-PowerShellDataFile -Path $manifestPath
-          $v = [version]([string]$manifest.ModuleVersion)
-          $new = [version]::new($v.Major, $v.Minor, $v.Build + 1)
+          # Date-based version format: yyyy.MM.dd.<github.run_number>
+          # - yyyy.MM.dd is in UTC (stable across runners)
+          # - github.run_number is a monotonically increasing integer per workflow in the repository
+          $date = (Get-Date).ToUniversalTime().ToString('yyyy.MM.dd')
+          $runNumber = [int]'${{ github.run_number }}'
+          $new = "$date.$runNumber"
 
           $content = Get-Content -LiteralPath $manifestPath -Raw
           $content2 = [regex]::Replace(
