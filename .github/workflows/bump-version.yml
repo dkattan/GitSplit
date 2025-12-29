@@ -71,6 +71,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Rebase onto latest main to avoid non-fast-forward failures in busy repos.
+          git fetch origin main
+          git rebase origin/main
+
           git add GitSplit.psd1
           git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
           git push
