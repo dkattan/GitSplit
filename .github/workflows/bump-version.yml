@@ -72,8 +72,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Rebase onto latest main to avoid non-fast-forward failures in busy repos.
+          # The manifest has already been edited in a previous step, so stash those changes first.
+          git stash push -u -m "pre-rebase"
           git fetch origin main
           git rebase origin/main
+          git stash pop
 
           git add GitSplit.psd1
           git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
