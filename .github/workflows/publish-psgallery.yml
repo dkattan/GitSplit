@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   test:
@@ -17,10 +18,37 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
+      - name: Download bump metadata artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bump-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read bump metadata
+        id: meta
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Test-Path 'bump-metadata.json')) {
+            throw 'Expected bump-metadata.json artifact in workspace.'
+          }
+
+          $meta = Get-Content -LiteralPath 'bump-metadata.json' -Raw | ConvertFrom-Json
+          if (-not $meta.version) { throw 'bump-metadata.json missing version' }
+          if (-not $meta.sha) { throw 'bump-metadata.json missing sha' }
+
+          "version=$($meta.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$($meta.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # Race-proof: checkout the exact bump commit created by the upstream workflow.
+          ref: ${{ steps.meta.outputs.sha }}
+          fetch-depth: 0
 
       - name: Install Pester
         shell: pwsh
@@ -44,15 +72,43 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
+      - name: Download bump metadata artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bump-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read bump metadata
+        id: meta
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Test-Path 'bump-metadata.json')) {
+            throw 'Expected bump-metadata.json artifact in workspace.'
+          }
+
+          $meta = Get-Content -LiteralPath 'bump-metadata.json' -Raw | ConvertFrom-Json
+          if (-not $meta.version) { throw 'bump-metadata.json missing version' }
+          if (-not $meta.sha) { throw 'bump-metadata.json missing sha' }
+
+          "version=$($meta.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha=$($meta.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # Race-proof: checkout the exact bump commit created by the upstream workflow.
+          ref: ${{ steps.meta.outputs.sha }}
+          fetch-depth: 0
 
       - name: Publish to PSGallery
         shell: pwsh
         env:
           PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
@@ -71,6 +127,12 @@ jobs:
           $manifest = Import-PowerShellDataFile -Path $manifestPath
           $version = [string]$manifest.ModuleVersion
           Write-Host "Publishing $moduleName version $version" -ForegroundColor Cyan
+
+          if ($env:EXPECTED_VERSION) {
+            if ($version -ne $env:EXPECTED_VERSION) {
+              throw "Manifest version '$version' does not match expected '$env:EXPECTED_VERSION' from bump metadata."
+            }
+          }
 
           # Publish-Module expects the module in a folder named after the module.
           $stagingRoot = Join-Path $env:RUNNER_TEMP 'psgallery'

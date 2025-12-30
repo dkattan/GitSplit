@@ -82,6 +82,26 @@ jobs:
           git commit -m "Bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
           git push
 
+      - name: Capture bump metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha="$(git rev-parse HEAD)"
+          version="${{ steps.bump.outputs.new_version }}"
+
+          printf '{"version":"%s","sha":"%s"}\n' "$version" "$sha" > bump-metadata.json
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bump metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bump-metadata
+          path: bump-metadata.json
+          if-no-files-found: error
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
