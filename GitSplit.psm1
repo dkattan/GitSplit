@@ -1446,4 +1446,4 @@ function Get-CommitMessageFromChanges {
 }
 
 
-Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges, Split-Patch
+Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges, Split-Patch, Split-Hunk
