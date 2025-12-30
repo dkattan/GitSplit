@@ -1242,4 +1242,4 @@ function Move-Commit {
 }
 
 
-Export-ModuleMember -Function Split-Commit, Add-Commit
+Export-ModuleMember -Function Split-Commit, Add-Commit, Move-Commit
