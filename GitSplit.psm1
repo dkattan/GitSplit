@@ -1445,5 +1445,10 @@ function Get-CommitMessageFromChanges {
   return "Update changes"
 }
 
-
-Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges, Split-Patch, Split-Hunk
+if ($env:CI) {
+  Write-Host "Exporting all module members for CI environment."
+  Export-ModuleMember *
+}
+else {
+  Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges
+}
