@@ -5,6 +5,84 @@ This module contains git-oriented patch/hunk/commit splitting utilities used by 
 It intentionally has no external dependencies beyond git being available on PATH.
 #>
 
+# Internal helper to run `git` in a way that does not leak informational stderr output to the host
+# (which some runners surface as error notifications), while still including stderr when the command fails.
+function Invoke-Git {
+  [CmdletBinding()]
+  param(
+    # Optional error message/context used when throwing.
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    # If set, suppresses output to the host.
+    [Parameter()]
+    [switch]$Quiet,
+
+    # If set, prints captured output to host in red on failure *before* throwing.
+    # This keeps diagnostics out of the PowerShell error stream while still failing fast.
+    [Parameter()]
+    [switch]$WriteHostOnError,
+
+    # Arguments to pass to git as discrete tokens.
+    # Use "ValueFromRemainingArguments" so callers can use normal syntax:
+    #   Invoke-Git -Quiet reset --hard HEAD~1
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$GitArgs
+  )
+
+  # Capture BOTH stdout+stderr so we can (a) avoid leaking stderr on success and
+  # (b) still show useful diagnostics on failure.
+  # PowerShell wraps native stderr lines as ErrorRecord objects even when redirected with 2>&1.
+  # Normalize everything to plain strings so callers/hosts don't treat stderr text as PowerShell errors.
+  # Use the pipeline so we can optionally stream output in real time.
+  & git @GitArgs 2>&1 | ForEach-Object {
+    if (!$Quiet) {
+      if ($WriteHostOnError -and $_ -is [System.Management.Automation.ErrorRecord]) { 
+        $_ | Out-String | Write-Host -ForegroundColor Red
+      }
+      else { 
+        # Keep output visible without using the error stream.
+        $_ | Out-String | Write-Host
+      }
+    }
+  }
+  
+  $exitCode = $LASTEXITCODE
+
+  if ($exitCode -ne 0) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "git $($GitArgs -join ' ')" }
+    $details = ($output | Where-Object { $_ -ne $null }) -join [Environment]::NewLine
+
+    if (-not $Quiet -and $WriteHostOnError -and -not [string]::IsNullOrWhiteSpace($details)) {
+      Write-Host $details -ForegroundColor Red
+    }
+
+    if ([string]::IsNullOrWhiteSpace($details) -or $WriteHostOnError) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+
+    throw "$ctx failed with exit code $exitCode`n$details"
+  }
+}
+
+# Internal helper to suppress PowerShell progress UI for noisy operations (e.g., Remove-Item).
+function Invoke-WithProgressSuppressed {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Script
+  )
+
+  $old = $global:ProgressPreference
+  try {
+    $global:ProgressPreference = 'SilentlyContinue'
+    & $Script
+  }
+  finally {
+    $global:ProgressPreference = $old
+  }
+}
+
 function Split-Patch {
   <#
   .SYNOPSIS
@@ -761,10 +839,7 @@ function Split-Commit {
 
   # Rewrite: go to parent, apply each piece-set as its own commit, then replay remaining commits.
   try {
-    git reset --hard $parent | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "git reset --hard $parent failed with exit code $LASTEXITCODE"
-    }
+    Invoke-Git -ErrorMessage "git reset --hard $parent" reset --hard $parent
 
     for ($i = 0; $i -lt $pieceCount; $i++) {
       # Build a combined patch for this piece index.
@@ -819,18 +894,24 @@ function Split-Commit {
       $keepSplitPatch = ($env:IMMYBUILD_KEEP_SPLIT_PATCH -eq '1') -or ($env:IMMYBUILD_KEEP_TEMPREPO -eq '1')
 
       # Split patches intentionally contain less context; apply them deterministically.
-      git apply --whitespace=nowarn --unidiff-zero $tmp | Out-Null
-      if ($LASTEXITCODE -ne 0) {
+      try {
+        Invoke-Git -ErrorMessage "git apply failed for split patch piece $i (file $tmp)" apply --whitespace=nowarn --unidiff-zero $tmp
+      }
+      catch {
         if (-not $keepSplitPatch) {
-          Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+          Invoke-WithProgressSuppressed {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+          }
         }
-        throw "git apply failed for split patch piece $i (file $tmp) with exit code $LASTEXITCODE"
+        throw
       }
       if (-not $keepSplitPatch) {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Invoke-WithProgressSuppressed {
+          Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
       }
 
-      git add -A | Out-Null
+      Invoke-Git -ErrorMessage 'git add -A' add -A
 
       # If the split piece results in no changes (can happen depending on split points), skip creating a commit.
       git diff --cached --quiet
@@ -839,10 +920,7 @@ function Split-Commit {
       }
 
       $msg = "$subject (split $($i + 1)/$pieceCount)"
-      git commit -m $msg | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "git commit failed while creating split commit piece $i with exit code $LASTEXITCODE"
-      }
+      Invoke-Git -ErrorMessage "git commit failed while creating split commit piece $i" commit -m $msg
 
       $newSha = (git rev-parse HEAD)
       if ($LASTEXITCODE -ne 0 -or -not $newSha) {
@@ -852,10 +930,7 @@ function Split-Commit {
     }
 
     foreach ($c in $afterTarget) {
-      git cherry-pick $c | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "git cherry-pick failed for $c with exit code $LASTEXITCODE"
-      }
+      Invoke-Git -ErrorMessage "git cherry-pick failed for $c" cherry-pick $c
     }
   }
   catch {
@@ -969,45 +1044,34 @@ function Add-Commit {
 
     git reset --hard $After | Out-Null
     if ($LASTEXITCODE -ne 0) {
+      # Preserve existing behavior for callers that rely on stdout/stderr of reset.
       throw "git reset --hard $After failed with exit code $LASTEXITCODE"
     }
 
     if ($olderCommit) {
-      git cherry-pick $olderCommit | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "git cherry-pick (older) failed for $olderCommit with exit code $LASTEXITCODE"
-      }
+      Invoke-Git -ErrorMessage "git cherry-pick (older) failed for $olderCommit" cherry-pick $olderCommit
     }
 
-    git cherry-pick $newerCommit | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "git cherry-pick (newer) failed for $newerCommit with exit code $LASTEXITCODE"
-    }
+    Invoke-Git -ErrorMessage "git cherry-pick (newer) failed for $newerCommit" cherry-pick $newerCommit
 
     if (-not (Test-Path $PatchFile)) {
       throw "Patch file not found: $PatchFile"
     }
 
     # Apply patch in a way that tolerates rewritten history (index/blob hashes may differ).
-    git apply --whitespace=nowarn $PatchFile | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      git apply --whitespace=nowarn --3way $PatchFile | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "git apply failed for $PatchFile with exit code $LASTEXITCODE"
-      }
+    try {
+      Invoke-Git -ErrorMessage "git apply failed for $PatchFile" apply --whitespace=nowarn $PatchFile
+    }
+    catch {
+      # Retry with 3-way apply; if this fails, bubble up diagnostics.
+      Invoke-Git -ErrorMessage "git apply --3way failed for $PatchFile" apply --whitespace=nowarn --3way $PatchFile
     }
 
-    git add -A | Out-Null
-    git commit -m $CommitMessage | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "git commit failed for patch $PatchFile (message: $CommitMessage) with exit code $LASTEXITCODE"
-    }
+    Invoke-Git -ErrorMessage 'git add -A' add -A
+    Invoke-Git -ErrorMessage "git commit failed for patch $PatchFile (message: $CommitMessage)" commit -m $CommitMessage
 
     foreach ($c in $remainingCommits) {
-      git cherry-pick $c | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "git cherry-pick (remaining) failed for $c with exit code $LASTEXITCODE"
-      }
+      Invoke-Git -ErrorMessage "git cherry-pick (remaining) failed for $c" cherry-pick $c
     }
   }
   finally {
@@ -1015,6 +1079,108 @@ function Add-Commit {
     $env:GIT_SEQUENCE_EDITOR = $oldSeq
     $env:GIT_EDITOR = $oldEd
   }
+}
+
+function Remove-Commit {
+  <#
+  .SYNOPSIS
+  Removes a commit from a branch by rewriting history.
+
+  .DESCRIPTION
+  Removes a commit from a given branch.
+
+  - If the commit is HEAD, this uses `git reset --hard HEAD~1`.
+  - If the commit is not HEAD, this uses `git rebase --onto <commit^> <commit> <branch>`
+    which replays commits after the target commit onto its parent.
+
+  This command rewrites history and may require force pushing.
+
+  .PARAMETER CommitRef
+  Commit-ish to remove (SHA, HEAD, etc.).
+
+  .PARAMETER Branch
+  Branch to remove the commit from. Defaults to the current branch.
+
+  .PARAMETER Push
+  If specified, pushes the rewritten branch to origin.
+
+  .PARAMETER ForcePush
+  If specified and -Push is set, uses --force-with-lease.
+
+  .OUTPUTS
+  System.String
+  The branch name rewritten.
+  #>
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  [OutputType([string])]
+  param(
+    [Parameter(Position = 0, Mandatory = $true)]
+    [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
+    [string]$CommitRef,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Branch,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePush
+  )
+
+  if (-not $Branch) {
+    $Branch = (git rev-parse --abbrev-ref HEAD)
+    if ($LASTEXITCODE -ne 0 -or -not $Branch) {
+      throw "Failed to get current branch."
+    }
+    $Branch = $Branch.Trim()
+  }
+
+  if ($Branch -eq 'HEAD') {
+    throw "You are in a detached HEAD state. Checkout a branch before calling Remove-Commit."
+  }
+
+  $commitHash = (git rev-parse $CommitRef)
+  if ($LASTEXITCODE -ne 0 -or -not $commitHash) {
+    throw "Failed to resolve commit reference '$CommitRef'."
+  }
+  $commitHash = $commitHash.Trim()
+
+  # Ensure the commit is on the branch we are rewriting.
+  git merge-base --is-ancestor $commitHash $Branch | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Commit $commitHash is not an ancestor of branch '$Branch'."
+  }
+
+  $branchHead = (git rev-parse $Branch).Trim()
+  if ($branchHead -eq $commitHash) {
+    if ($PSCmdlet.ShouldProcess($Branch, "Remove HEAD commit (reset --hard $Branch~1)")) {
+      Invoke-Git -ErrorMessage "git reset --hard $Branch~1" reset --hard "$Branch~1"
+    }
+  }
+  else {
+    git rev-parse --verify "$commitHash^" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "Cannot remove the initial commit via rebase."
+    }
+
+    if ($PSCmdlet.ShouldProcess($Branch, "Remove commit via rebase --onto")) {
+      # Rebase the *branch ref* so we don't end up detached.
+      Invoke-Git -ErrorMessage "git rebase --onto failed while removing $commitHash from $Branch" rebase --onto "$commitHash^" $commitHash $Branch
+    }
+  }
+
+  if ($Push) {
+    if ($ForcePush) {
+      Invoke-Git -ErrorMessage "git push --force-with-lease origin $Branch" push --force-with-lease origin $Branch
+    }
+    else {
+      Invoke-Git -ErrorMessage "git push origin $Branch" push origin $Branch
+    }
+  }
+
+  return $Branch
 }
 
 function Move-Commit {
@@ -1106,10 +1272,7 @@ function Move-Commit {
       }
 
       $stashName = "gitsplit-move-commit-$(Get-Date -Format 'yyyyMMddHHmmss')"
-      git stash push -u -m $stashName | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "Failed to stash changes."
-      }
+      Invoke-Git -ErrorMessage 'git stash push failed' stash push -u -m $stashName
       $stashed = $true
     }
 
@@ -1154,72 +1317,22 @@ function Move-Commit {
     if ($PSCmdlet.ShouldProcess("$DestinationBranch", "Cherry-pick $commitHash")) {
       if ($remoteBranchExists -and -not $branchExists) {
         # Create a local branch from origin in the worktree.
-        git worktree add -b $DestinationBranch $destWorktreePath "origin/$DestinationBranch" | Out-Null
+        Invoke-Git -ErrorMessage "git worktree add -b $DestinationBranch" worktree add -b $DestinationBranch $destWorktreePath "origin/$DestinationBranch"
       }
       else {
-        git worktree add $destWorktreePath $DestinationBranch | Out-Null
-      }
-      if ($LASTEXITCODE -ne 0) {
-        throw "Failed to add worktree for destination branch '$DestinationBranch'."
+        Invoke-Git -ErrorMessage "git worktree add $DestinationBranch" worktree add $destWorktreePath $DestinationBranch
       }
 
       # Apply commit to destination.
-      git -C $destWorktreePath cherry-pick $commitHash | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "Failed to cherry-pick commit $commitHash onto '$DestinationBranch'. Resolve conflicts in worktree '$destWorktreePath' and run 'git -C <path> cherry-pick --continue' or '--abort'."
-      }
+      Invoke-Git -ErrorMessage "git -C <worktree> cherry-pick failed for $commitHash" -C $destWorktreePath cherry-pick $commitHash
 
       if ($Push) {
-        git -C $destWorktreePath push -u origin $DestinationBranch | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to push destination branch '$DestinationBranch' to origin."
-        }
+        Invoke-Git -ErrorMessage "git -C <worktree> push failed for $DestinationBranch" -C $destWorktreePath push -u origin $DestinationBranch
       }
     }
 
     if ($RemoveFromSource) {
-      # Ensure the commit is on the current branch.
-      git merge-base --is-ancestor $commitHash HEAD | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "Commit $commitHash is not an ancestor of current branch '$currentBranch'. Move-Commit can only remove commits from the current branch."
-      }
-
-      $headHash = (git rev-parse HEAD).Trim()
-      if ($headHash -eq $commitHash) {
-        # Remove latest commit.
-        if ($PSCmdlet.ShouldProcess($currentBranch, "Remove HEAD commit (reset --hard HEAD~1)")) {
-          git reset --hard HEAD~1 | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to reset and remove HEAD commit from '$currentBranch'."
-          }
-        }
-      }
-      else {
-        # Remove non-HEAD commit by rebasing commits after it onto its parent.
-        git rev-parse --verify "$commitHash^" 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-          throw "Cannot remove the initial commit via rebase."
-        }
-
-        if ($PSCmdlet.ShouldProcess($currentBranch, "Remove commit via rebase --onto")) {
-          git rebase --onto "$commitHash^" $commitHash HEAD | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to rebase and remove commit $commitHash from '$currentBranch'. Resolve conflicts and run 'git rebase --continue' or abort with 'git rebase --abort'."
-          }
-        }
-      }
-
-      if ($Push) {
-        if ($ForcePushSource) {
-          git push --force-with-lease origin $currentBranch | Out-Null
-        }
-        else {
-          git push origin $currentBranch | Out-Null
-        }
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to push updated source branch '$currentBranch' to origin."
-        }
-      }
+      $null = Remove-Commit -CommitRef $commitHash -Branch $currentBranch -Push:$Push -ForcePush:$ForcePushSource
     }
 
     return $DestinationBranch
@@ -1232,14 +1345,105 @@ function Move-Commit {
 
     if ($stashed) {
       # Try to re-apply the stash created by this function.
-      # Use pop so we don't leak stashes.
-      git stash list | Select-String -SimpleMatch $stashName | Out-Null
-      if ($LASTEXITCODE -eq 0) {
-        git stash pop | Out-Null
+      # IMPORTANT: do NOT pop/apply if we're mid-merge/rebase/cherry-pick.
+      # Also, pop the *specific* stash we created (not simply the top of the stash stack).
+
+      $gitDir = (git rev-parse --git-dir)
+      if ($LASTEXITCODE -eq 0 -and $gitDir) {
+        $gitDir = $gitDir.Trim()
+        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+          $gitDir = Join-Path $repoRoot $gitDir
+        }
+      }
+
+      $stashLine = $null
+      try {
+        $stashLine = (git stash list --format="%gd %s" | Where-Object { $_ -like "*${stashName}*" } | Select-Object -First 1)
+      }
+      catch {
+        $stashLine = $null
+      }
+
+      if ($stashLine) {
+        $stashRef = ($stashLine -split '\s+', 2)[0]
+
+        $inProgress = $false
+        if ($gitDir -and (Test-Path -LiteralPath $gitDir)) {
+          $inProgress = (
+            (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-apply')) -or
+            (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-merge')) -or
+            (Test-Path -LiteralPath (Join-Path $gitDir 'MERGE_HEAD')) -or
+            (Test-Path -LiteralPath (Join-Path $gitDir 'CHERRY_PICK_HEAD')) -or
+            (Test-Path -LiteralPath (Join-Path $gitDir 'REVERT_HEAD'))
+          )
+        }
+
+        if ($inProgress) {
+          Write-Error @(
+            "Move-Commit created a stash ('$stashName' -> $stashRef) but will NOT restore it because git reports an in-progress operation (merge/rebase/cherry-pick/revert).",
+            '',
+            'How to proceed:',
+            "  1) Inspect state:            git status",
+            "  2) Finish or abort operation: git rebase --continue | git rebase --abort | git merge --abort | git cherry-pick --abort | git revert --abort",
+            "  3) Then restore your changes: git stash pop $stashRef",
+            '',
+            'How to undo the branch rewrite (if you used -RemoveFromSource):',
+            "  - Find the pre-rewrite commit in reflog: git reflog",
+            "  - Reset branch back to it:              git reset --hard <sha>",
+            "  - If you pushed/force-pushed:           git push --force-with-lease"
+          ) -join [Environment]::NewLine
+        }
+        else {
+          git stash pop $stashRef | Out-Null
+        }
       }
     }
   }
 }
 
+function Get-CommitMessageFromChanges {
+  <#
+  .SYNOPSIS
+  Generates a commit message suggestion from current repo changes.
 
-Export-ModuleMember -Function Split-Commit, Add-Commit, Move-Commit
+  .DESCRIPTION
+  This function is intentionally lightweight and dependency-free.
+  - If there are no changes in the working tree or index, returns $null.
+  - If there are changes but no Anthropic API key/token is configured, throws.
+
+  NOTE: The full "AI-generated message" behavior is intentionally not implemented here.
+  The module's tests currently validate only the no-changes and no-key guardrails.
+
+  .PARAMETER DiffLevel
+  Controls how much diff context would be used for generation (reserved for future use).
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('None', 'Summary', 'Full')]
+    [string]$DiffLevel = 'Summary'
+  )
+
+  # Detect changes (staged or unstaged). git diff --quiet returns exit code 1 when there are changes.
+  git diff --quiet | Out-Null
+  $hasUnstaged = ($LASTEXITCODE -ne 0)
+
+  git diff --cached --quiet | Out-Null
+  $hasStaged = ($LASTEXITCODE -ne 0)
+
+  if (-not $hasUnstaged -and -not $hasStaged) {
+    return $null
+  }
+
+  $key = $env:AnthropicKey
+  if (-not $key) { $key = $env:ANTHROPIC_TOKEN }
+  if ([string]::IsNullOrWhiteSpace($key)) {
+    throw "Anthropic key is not set. Set env:AnthropicKey or env:ANTHROPIC_TOKEN."
+  }
+
+  # Placeholder: a deterministic fallback until an LLM-backed implementation is added.
+  return "Update changes"
+}
+
+
+Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges

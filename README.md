@@ -73,6 +73,26 @@ Creates a range object that converts between (Line, Column) and 0-based Index fo
 
 Deterministically inserts a new commit by applying a patch while replaying history.
 
+### `Remove-Commit`
+
+Removes a commit from a branch by rewriting history.
+
+- If the commit is `HEAD`, it uses a hard reset to remove the latest commit.
+- If the commit is not `HEAD`, it uses a rebase to drop that commit while keeping later commits.
+
+> Warning: this rewrites history. If you already pushed the branch, you will likely need to force push.
+
+```powershell
+# Remove the latest commit from the current branch
+Remove-Commit -CommitRef HEAD
+
+# Remove a non-HEAD commit (by SHA) from a specific branch
+Remove-Commit -CommitRef 0123abcd -Branch feature/my-branch
+
+# Rewrite and push the branch update (safer force push)
+Remove-Commit -CommitRef HEAD~1 -Push -ForcePush
+```
+
 ### `Move-Commit`
 
 Applies a commit to another branch (via cherry-pick) **without switching branches** in your current working directory.
@@ -90,6 +110,27 @@ Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted
 
 # Move HEAD to another branch and remove it from the current branch
 Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -RemoveFromSource
+```
+
+### `Get-CommitMessageFromChanges`
+
+Suggests a commit message based on your current repo changes.
+
+Notes:
+
+- If there are **no staged or unstaged changes**, it returns `$null`.
+- If there **are** changes, it currently requires an Anthropic API key to be set (future enhancement).
+
+Set one of:
+
+- `AnthropicKey`
+- `ANTHROPIC_TOKEN`
+
+```powershell
+$msg = Get-CommitMessageFromChanges
+if ($msg) {
+  git commit -am $msg
+}
 ```
 
 ## Development

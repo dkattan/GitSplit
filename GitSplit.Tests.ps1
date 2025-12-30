@@ -8,6 +8,9 @@ Describe "GitSplit" {
   }
 
   BeforeEach {
+    $oldProgressPreference = $global:ProgressPreference
+    $global:ProgressPreference = 'SilentlyContinue'
+
     if (Test-Path $script:TempRepoPath) {
       Remove-Item -Path $script:TempRepoPath -Recurse -Force
     }
@@ -16,7 +19,9 @@ Describe "GitSplit" {
 
     Push-Location $script:TempRepoPath
     try {
-      git init | Out-Null
+      # Quiet and suppress stderr: VS Code test runners may surface native stderr as error notifications.
+      # Also set init.defaultBranch per-command to avoid "Using 'master'..." advisory output.
+      git -c init.defaultBranch=main init -q 2>$null | Out-Null
 
       # Make newline handling deterministic inside this temp repo.
       # We want patches/hunks to be generated and applied consistently regardless of host settings.
@@ -78,19 +83,26 @@ Describe "GitSplit" {
     }
     finally {
       Pop-Location
+      $global:ProgressPreference = $oldProgressPreference
     }
   }
 
   AfterEach {
+    $oldProgressPreference = $global:ProgressPreference
+    $global:ProgressPreference = 'SilentlyContinue'
+
     # Set IMMYBUILD_KEEP_TEMPREPO=1 to keep the repo around for debugging.
     if ($env:IMMYBUILD_KEEP_TEMPREPO -eq '1') {
       Write-Host "Keeping temprepo at: $script:TempRepoPath" -ForegroundColor Yellow
+      $global:ProgressPreference = $oldProgressPreference
       return
     }
 
     if ($script:TempRepoPath -and (Test-Path $script:TempRepoPath)) {
       Remove-Item -Path $script:TempRepoPath -Recurse -Force
     }
+
+    $global:ProgressPreference = $oldProgressPreference
   }
 
   Describe "Split-Patch" {
@@ -229,7 +241,8 @@ Describe "GitSplit" {
         $subjectsText | Should -Match 'Modify b\.txt \(split 2/2\)'
 
         # Validate the contents of the first split commit.
-        git checkout --detach $created[0] | Out-Null
+        # Quiet and suppress stderr: some runners surface native stderr as error notifications.
+        git checkout --detach -q $created[0] 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) {
           throw "Expected to be able to checkout first split commit $($created[0])"
         }
@@ -238,7 +251,8 @@ Describe "GitSplit" {
         $first | Should -Not -Contain ' again)'
 
         # Switch back to the latest split commit before validating the final file contents.
-        git checkout --detach $created[1] | Out-Null
+        # Quiet and suppress stderr: some runners surface native stderr as error notifications.
+        git checkout --detach -q $created[1] 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) {
           throw "Expected to be able to checkout second split commit $($created[1])"
         }
@@ -284,6 +298,136 @@ Describe "GitSplit" {
         # ToString() returns the cached value
         $s1 = $r1.ToString()
         $s1 | Should -Be "${p}:2:3+2"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Remove-Commit" {
+    It "removes the HEAD commit from the current branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $branch | Should -Not -Be 'HEAD'
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $beforeSubject = (git log -1 --pretty=format:%s).Trim()
+        $beforeSubject | Should -Be 'Modify b.txt'
+
+        $result = Remove-Commit -CommitRef 'HEAD'
+        $result | Should -Be $branch
+
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be ($beforeCount - 1)
+
+        $afterSubject = (git log -1 --pretty=format:%s).Trim()
+        $afterSubject | Should -Be 'Modify a.txt and b.txt'
+
+        $subjectsText = (git log -n 50 --pretty=format:%s) -join "`n"
+        $subjectsText | Should -Not -Match "(?m)^Modify b\\.txt$"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when called from a detached HEAD" {
+      Push-Location $script:TempRepoPath
+      try {
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $branch | Should -Not -Be 'HEAD'
+
+        git checkout --detach -q HEAD 2>$null | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        { Remove-Commit -CommitRef 'HEAD' } | Should -Throw -ExpectedMessage '*detached HEAD*'
+      }
+      finally {
+        # Ensure we return to a branch for cleanup (and to avoid confusing later tests).
+        git checkout -q - 2>$null | Out-Null
+        Pop-Location
+      }
+    }
+
+    It "throws when the target commit is not on the specified branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $branch | Should -Not -Be 'HEAD'
+
+        # Create a side branch with a unique commit that will NOT exist on the main branch.
+        git branch side | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        git checkout -q side 2>$null | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'side-branch-only' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m "Side branch only $(New-Guid)" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        $sideCommit = (git rev-parse HEAD).Trim()
+        $sideCommit | Should -Match '^[0-9a-f]{7,40}$'
+
+        git checkout -q $branch 2>$null | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        { Remove-Commit -CommitRef $sideCommit -Branch $branch } | Should -Throw -ExpectedMessage '*not an ancestor*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when attempting to remove the initial (root) commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $branch | Should -Not -Be 'HEAD'
+
+        $root = (git rev-list --max-parents=0 HEAD).Trim()
+        $root | Should -Match '^[0-9a-f]{7,40}$'
+
+        { Remove-Commit -CommitRef $root -Branch $branch } | Should -Throw -ExpectedMessage '*initial commit*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "removes a non-HEAD commit from the branch by rebasing" {
+      Push-Location $script:TempRepoPath
+      try {
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $branch | Should -Not -Be 'HEAD'
+
+        # Create TWO commits so HEAD~1 is a non-HEAD commit to remove.
+        'remove-me' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        $msgToRemove = "Commit to REMOVE $(New-Guid)"
+        git commit -m $msgToRemove | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Make the next commit touch a different file so removing the first commit rebases cleanly.
+        'keep-me' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+        $msgToKeep = "Commit to KEEP $(New-Guid)"
+        git commit -m $msgToKeep | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Remove the previous commit (non-HEAD).
+        $result = Remove-Commit -CommitRef 'HEAD~1' -Branch $branch
+        $result | Should -Be $branch
+
+        # HEAD should still be the later commit subject.
+        (git log -1 --pretty=format:%s).Trim() | Should -Be $msgToKeep
+
+        $subjectsText = (git log -n 50 --pretty=format:%s) -join "`n"
+        $subjectsText | Should -Match ([regex]::Escape($msgToKeep))
+        $subjectsText | Should -Not -Match ([regex]::Escape($msgToRemove))
       }
       finally {
         Pop-Location
