@@ -1450,5 +1450,14 @@ if ($env:CI) {
   Export-ModuleMember *
 }
 else {
-  Export-ModuleMember -Function Split-Commit, Add-Commit, Remove-Commit, Move-Commit, Get-CommitMessageFromChanges
+  # NOTE: The module manifest (GitSplit.psd1) also declares FunctionsToExport.
+  # PowerShell effectively filters exports through BOTH lists, so keep them aligned
+  # to avoid surprising "only the intersection" exports.
+  Export-ModuleMember -Function @(
+    'Split-Commit'
+    'Add-Commit'
+    'Remove-Commit'
+    'Move-Commit'
+    'Get-CommitMessageFromChanges'
+  )
 }

@@ -10,12 +10,11 @@
   PowerShellVersion = '5.1'
 
   FunctionsToExport = @(
-    'Split-Patch'
-    'Split-Hunk'
-    'New-Hunk'
-    'New-Range'
     'Split-Commit'
     'Add-Commit'
+    'Remove-Commit'
+    'Move-Commit'
+    'Get-CommitMessageFromChanges'
   )
   CmdletsToExport   = @()
   VariablesToExport = @()
