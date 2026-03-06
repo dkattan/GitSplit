@@ -159,7 +159,25 @@ if ($msg) {
 ### Run tests
 
 ```powershell
-Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI
+$config = New-PesterConfiguration
+$config.Run.Path = "./GitSplit.Tests.ps1"
+$config.Output.Verbosity = "Detailed"
+
+Invoke-Pester -Configuration $config
+```
+
+### Run tests with coverage
+
+```powershell
+$config = New-PesterConfiguration
+$config.Run.Path = "./GitSplit.Tests.ps1"
+$config.Run.PassThru = $true
+$config.Output.Verbosity = "Detailed"
+$config.CodeCoverage.Enabled = $true
+$config.CodeCoverage.Path = "./GitSplit.psm1"
+
+$result = Invoke-Pester -Configuration $config
+$result.CodeCoverage.CoveragePercent
 ```
 
 ## Publishing

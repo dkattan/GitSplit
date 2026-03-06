@@ -511,6 +511,59 @@ Describe "GitSplit" {
         Pop-Location
       }
     }
+
+    It "preserves the destination worktree when cherry-pick conflicts" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $sourceBranch | Should -Not -Be 'HEAD'
+
+        git branch conflict-dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        git checkout conflict-dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        @(
+          'a-line-1'
+          'a-line-2 (dest change)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m "Destination conflicting change" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        git checkout $sourceBranch | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        @(
+          'a-line-1'
+          'a-line-2 (source change)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m "Source conflicting change" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        { Move-Commit -CommitRef HEAD -DestinationBranch 'conflict-dest' } | Should -Throw
+
+        $wtRoot = Join-Path $script:TempRepoPath '.gitsplit-worktrees'
+        Test-Path $wtRoot | Should -BeTrue
+
+        $preserved = @(Get-ChildItem -Path $wtRoot -Directory)
+        $preserved | Should -HaveCount 1
+
+        $status = @(git -C $preserved[0].FullName status --porcelain)
+        ($status -join "`n") | Should -Match 'UU a.txt'
+
+        git worktree remove --force $preserved[0].FullName 2>$null | Out-Null
+      }
+      finally {
+        Pop-Location
+      }
+    }
   }
 
   Describe "Get-CommitMessageFromChanges" {

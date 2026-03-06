@@ -1509,6 +1509,8 @@ function Move-Commit {
   $stashed = $false
   $stashName = $null
   $destWorktreePath = $null
+  $destWorktreeCreated = $false
+  $moveSucceeded = $false
 
   try {
     # Ensure worktree safety. A dirty tree can make destructive operations risky.
@@ -1572,6 +1574,7 @@ function Move-Commit {
       else {
         Invoke-Git -ErrorMessage "git worktree add $DestinationBranch" worktree add $destWorktreePath $DestinationBranch
       }
+      $destWorktreeCreated = $true
 
       # Apply commit to destination.
       Invoke-Git -ErrorMessage "git -C <worktree> cherry-pick failed for $commitHash" -C $destWorktreePath cherry-pick $commitHash
@@ -1585,12 +1588,15 @@ function Move-Commit {
       $null = Remove-Commit -CommitRef $commitHash -Branch $currentBranch -Push:$Push -ForcePush:$ForcePushSource
     }
 
+    $moveSucceeded = $true
     return $DestinationBranch
   }
   finally {
-    # Best-effort cleanup: remove worktree.
-    if ($destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
+    if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
       git worktree remove --force $destWorktreePath 2>$null | Out-Null
+    }
+    elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
+      Write-Warning "Preserving destination worktree at '$destWorktreePath' so conflicts can be resolved manually."
     }
 
     if ($stashed) {
