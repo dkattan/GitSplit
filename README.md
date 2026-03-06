@@ -112,6 +112,27 @@ Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted
 Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -RemoveFromSource
 ```
 
+### `Set-CommitOrder`
+
+Reorders commits in the current branch by driving `git rebase -i` with a generated
+sequence editor, so you do not need to edit the todo list manually.
+
+`GitSplit` does not depend on Graphite or `gt`. If you pass `-Absorb`, it creates
+dependency-free `fixup!` commits from staged changes and runs the reorder with
+`--autosquash`.
+
+```powershell
+# Reorder the last two commits
+Set-CommitOrder -OrderedCommits @(
+  'abc1234'
+  'def5678'
+) -BaseRef HEAD~2
+
+# Stage feedback fixes, absorb them into earlier commits, then reorder
+git add c.txt
+Set-CommitOrder -OrderedCommits @('def5678', 'abc1234') -BaseRef HEAD~2 -Absorb
+```
+
 ### `Get-CommitMessageFromChanges`
 
 Suggests a commit message based on your current repo changes.
