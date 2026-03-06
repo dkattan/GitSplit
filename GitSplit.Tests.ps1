@@ -1,10 +1,16 @@
 Describe "GitSplit" {
 
   BeforeAll {
+    $script:OldCi = $env:CI
+    $env:CI = '1'
     Import-Module "$PSScriptRoot/GitSplit.psm1" -Force
 
     # Shared path, but the repo itself is re-created per test.
     $script:TempRepoPath = Join-Path $PSScriptRoot 'temprepo'
+  }
+
+  AfterAll {
+    $env:CI = $script:OldCi
   }
 
   BeforeEach {
@@ -541,6 +547,72 @@ Describe "GitSplit" {
       finally {
         $env:AnthropicKey = $oldAnthropicKey
         $env:ANTHROPIC_TOKEN = $oldAnthropicToken
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Set-CommitOrder" {
+    It "reorders commits in the requested order for a selected range" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create two independent commits so reordering is deterministic.
+        'c-line-1' | Set-Content -Path 'c.txt'
+        git add c.txt | Out-Null
+        git commit -m "Add c.txt" | Out-Null
+        $commitC = (git rev-parse HEAD).Trim()
+
+        'd-line-1' | Set-Content -Path 'd.txt'
+        git add d.txt | Out-Null
+        git commit -m "Add d.txt" | Out-Null
+        $commitD = (git rev-parse HEAD).Trim()
+
+        $beforeCount = [int](git rev-list --count HEAD)
+
+        # Reorder only the last two commits by using HEAD~2 as the base.
+        Set-CommitOrder -OrderedCommits @($commitD, $commitC) -BaseRef 'HEAD~2'
+
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be $beforeCount
+
+        $subjects = @(git log --reverse --format=%s HEAD~2..HEAD)
+        $subjects | Should -Be @('Add d.txt', 'Add c.txt')
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "absorbs staged changes into fixup commits before reordering when -Absorb is specified" {
+      Push-Location $script:TempRepoPath
+      try {
+        'c-line-1' | Set-Content -Path 'c.txt'
+        git add c.txt | Out-Null
+        git commit -m "Add c.txt" | Out-Null
+        $commitC = (git rev-parse HEAD).Trim()
+
+        'd-line-1' | Set-Content -Path 'd.txt'
+        git add d.txt | Out-Null
+        git commit -m "Add d.txt" | Out-Null
+        $commitD = (git rev-parse HEAD).Trim()
+
+        # Stage a fix to c.txt that should be absorbed into the "Add c.txt" commit.
+        'c-line-1-updated' | Set-Content -Path 'c.txt'
+        git add c.txt | Out-Null
+
+        Set-CommitOrder -OrderedCommits @($commitD, $commitC) -BaseRef 'HEAD~2' -Absorb
+
+        # Absorb should leave no staged work behind and rewrite c.txt inside history.
+        git diff --cached --quiet
+        $LASTEXITCODE | Should -Be 0
+
+        $subjects = @(git log --reverse --format=%s HEAD~2..HEAD)
+        $subjects | Should -Be @('Add d.txt', 'Add c.txt')
+
+        $cHead = (git show HEAD:c.txt).Trim()
+        $cHead | Should -Be 'c-line-1-updated'
+      }
+      finally {
         Pop-Location
       }
     }

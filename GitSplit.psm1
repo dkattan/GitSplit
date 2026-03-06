@@ -1183,6 +1183,256 @@ function Remove-Commit {
   return $Branch
 }
 
+function Invoke-GitSplitAbsorb {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$From
+  )
+
+  $unstagedFiles = @(
+    git diff --name-only |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to inspect unstaged changes before absorb."
+  }
+  if ($unstagedFiles.Count -gt 0) {
+    throw "Invoke-GitSplitAbsorb requires staged-only changes. Stage or stash unstaged changes before using -Absorb."
+  }
+
+  $stagedFiles = @(
+    git diff --cached --name-only |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to inspect staged changes before absorb."
+  }
+  if ($stagedFiles.Count -eq 0) {
+    return @()
+  }
+
+  $targetByFile = @{}
+  $unmatchedFiles = @()
+  foreach ($file in $stagedFiles) {
+    $targetCommit = @(
+      git log --format=%H "$From..HEAD" -- "$file" |
+        Select-Object -First 1 |
+        ForEach-Object { $_.Trim() }
+    )
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to determine absorb target for '$file'."
+    }
+
+    if ($targetCommit.Count -eq 0 -or [string]::IsNullOrWhiteSpace($targetCommit[0])) {
+      $unmatchedFiles += $file
+      continue
+    }
+
+    $targetByFile[$file] = $targetCommit[0]
+  }
+
+  if ($unmatchedFiles.Count -gt 0) {
+    throw "Could not determine absorb target commit(s) for staged file(s): $($unmatchedFiles -join ', ')"
+  }
+
+  $orderedTargets = @(
+    git rev-list --reverse "$From..HEAD" |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+      Where-Object { $_ -in $targetByFile.Values }
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to enumerate commit order for absorb."
+  }
+
+  $createdFixups = @()
+  foreach ($targetCommit in $orderedTargets) {
+    $targetFiles = @(
+      $targetByFile.GetEnumerator() |
+        Where-Object { $_.Value -eq $targetCommit } |
+        Sort-Object Name |
+        ForEach-Object { $_.Name }
+    )
+    if ($targetFiles.Count -eq 0) {
+      continue
+    }
+
+    & git commit --fixup $targetCommit -- @targetFiles
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to create fixup commit for absorb target '$targetCommit'."
+    }
+
+    $fixupCommit = (git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $fixupCommit -notmatch '^[0-9a-f]{40}$') {
+      throw "Failed to resolve absorb fixup commit for target '$targetCommit'."
+    }
+    $createdFixups += $fixupCommit
+  }
+
+  return $createdFixups
+}
+
+function Set-CommitOrder {
+  <#
+  .SYNOPSIS
+  Reorders commits in the current branch without requiring interactive editing.
+
+  .DESCRIPTION
+  Reorders commits reachable from the current branch by driving `git rebase -i`
+  with a generated sequence editor script.
+
+  When `-Absorb` is specified, staged changes are first converted into `fixup!`
+  commits targeting the most recent commit in the selected range that touched each
+  staged file, and the rebase runs with `--autosquash`.
+  #>
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$OrderedCommits,
+
+    [Parameter()]
+    [switch]$Autostash,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$BaseRef = "origin/main",
+
+    [Parameter()]
+    [switch]$Absorb
+  )
+
+  try {
+    if ($OrderedCommits.Count -eq 0) {
+      throw "Provide at least one commit hash to reorder."
+    }
+
+    $currentBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {
+      throw "Failed to get current branch."
+    }
+    if ($currentBranch -eq 'HEAD') {
+      throw "Set-CommitOrder must run on a branch (detached HEAD is not supported)."
+    }
+
+    $status = git status --porcelain
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to determine git status."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($status) -and -not $Autostash -and -not $Absorb) {
+      throw "Working tree is not clean. Commit/stash changes or re-run with -Autostash."
+    }
+
+    git rev-parse --verify "$BaseRef^{commit}" 1>$null 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      throw "Base reference '$BaseRef' is not valid."
+    }
+
+    $from = (git merge-base HEAD $BaseRef).Trim()
+    if ($LASTEXITCODE -ne 0 -or $from -notmatch '^[0-9a-f]{40}$') {
+      throw "Failed to determine merge-base between HEAD and '$BaseRef'."
+    }
+
+    $resolvedOrderedCommits = @()
+    foreach ($orderedCommit in $OrderedCommits) {
+      if ([string]::IsNullOrWhiteSpace($orderedCommit)) {
+        continue
+      }
+
+      $resolvedCommit = (git rev-parse --verify "$orderedCommit^{commit}" 2>$null).Trim()
+      if ($LASTEXITCODE -ne 0 -or $resolvedCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Failed to resolve ordered commit '$orderedCommit'."
+      }
+
+      git merge-base --is-ancestor $resolvedCommit HEAD | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "Commit '$orderedCommit' ($resolvedCommit) is not reachable from current branch '$currentBranch'."
+      }
+
+      git merge-base --is-ancestor $from $resolvedCommit | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "Commit '$orderedCommit' ($resolvedCommit) is outside the reorder range '$from..HEAD'."
+      }
+
+      if ($resolvedCommit -notin $resolvedOrderedCommits) {
+        $resolvedOrderedCommits += $resolvedCommit
+      }
+    }
+
+    if ($resolvedOrderedCommits.Count -eq 0) {
+      throw "No valid commits were provided to reorder."
+    }
+
+    if ($Absorb) {
+      $null = Invoke-GitSplitAbsorb -From $from
+    }
+
+    $sequenceEditorScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gitsplit-seq-editor-" + [Guid]::NewGuid().ToString("N") + ".ps1")
+    $todoScriptPath = Join-Path $PSScriptRoot "New-RebaseTodo.ps1"
+    if (-not (Test-Path -LiteralPath $todoScriptPath)) {
+      throw "Could not find sequence editor helper '$todoScriptPath'."
+    }
+
+    $escapedTodoScriptPath = $todoScriptPath.Replace("'", "''")
+    $escapedFrom = $from.Replace("'", "''")
+    $scriptLines = @(
+      'param([string]$TodoPath)',
+      '$ErrorActionPreference = "Stop"',
+      "& '$escapedTodoScriptPath' `$TodoPath -From '$escapedFrom' -OrderedCommits @(",
+      ($resolvedOrderedCommits | ForEach-Object { "  '" + $_.Replace("'", "''") + "'" }),
+      ')'
+    )
+    Set-Content -Path $sequenceEditorScriptPath -Value $scriptLines
+
+    $previousSequenceEditor = $env:GIT_SEQUENCE_EDITOR
+    try {
+      $env:GIT_SEQUENCE_EDITOR = "pwsh -NoProfile -File `"$sequenceEditorScriptPath`""
+      $rebaseArgs = @('rebase', '-i')
+      if ($Autostash) {
+        $rebaseArgs += '--autostash'
+      }
+      if ($Absorb) {
+        $rebaseArgs += '--autosquash'
+      }
+      $rebaseArgs += $from
+
+      & git @rebaseArgs
+      if ($LASTEXITCODE -ne 0) {
+        throw "Set-CommitOrder rebase failed. Resolve conflicts and continue/abort rebase manually."
+      }
+    }
+    finally {
+      if ($null -ne $previousSequenceEditor) {
+        $env:GIT_SEQUENCE_EDITOR = $previousSequenceEditor
+      }
+      else {
+        Remove-Item Env:GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue
+      }
+
+      if (Test-Path -LiteralPath $sequenceEditorScriptPath) {
+        Remove-Item -Path $sequenceEditorScriptPath -Force -ErrorAction SilentlyContinue
+      }
+    }
+
+    return @(
+      git log --reverse --format=%H "$from..HEAD" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+  }
+  catch {
+    Write-Error "Failed to set commit order: $_"
+    throw
+  }
+}
+
 function Move-Commit {
   <#
   .SYNOPSIS
@@ -1458,6 +1708,7 @@ else {
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
+    'Set-CommitOrder'
     'Get-CommitMessageFromChanges'
   )
 }

@@ -14,6 +14,7 @@
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
+    'Set-CommitOrder'
     'Get-CommitMessageFromChanges'
   )
   CmdletsToExport   = @()
@@ -29,15 +30,3 @@
     }
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
