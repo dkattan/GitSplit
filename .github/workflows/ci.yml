@@ -35,4 +35,10 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
 
-          Invoke-Pester -Path "./GitSplit.Tests.ps1" -CI -Output Detailed
+          $config = New-PesterConfiguration
+          $config.Run.Path = './GitSplit.Tests.ps1'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.Output.Verbosity = 'Detailed'
+
+          Invoke-Pester -Configuration $config
