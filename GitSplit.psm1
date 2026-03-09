@@ -467,7 +467,7 @@ function New-Hunk {
 
   $header = "@@ -$OldStart,$OldCount +$NewStart,$NewCount @@"
 
-  if (-not $BodyLines -or $BodyLines.Count -eq 0) {
+  if ($null -eq $BodyLines -or $BodyLines.Count -eq 0) {
     return $header + "`n"
   }
 
@@ -1262,10 +1262,7 @@ function Invoke-GitSplitAbsorb {
       continue
     }
 
-    & git commit --fixup $targetCommit -- @targetFiles
-    if ($LASTEXITCODE -ne 0) {
-      throw "Failed to create fixup commit for absorb target '$targetCommit'."
-    }
+    Invoke-Git -Quiet -ErrorMessage "Failed to create fixup commit for absorb target '$targetCommit'." commit --fixup $targetCommit -- @targetFiles
 
     $fixupCommit = (git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or $fixupCommit -notmatch '^[0-9a-f]{40}$') {
@@ -1346,8 +1343,10 @@ function Set-CommitOrder {
         continue
       }
 
-      $resolvedCommit = (git rev-parse --verify "$orderedCommit^{commit}" 2>$null).Trim()
-      if ($LASTEXITCODE -ne 0 -or $resolvedCommit -notmatch '^[0-9a-f]{40}$') {
+      $resolvedCommitOutput = git rev-parse --verify "$orderedCommit^{commit}" 2>$null
+      $resolvedCommitExitCode = $LASTEXITCODE
+      $resolvedCommit = if ($resolvedCommitExitCode -eq 0 -and $null -ne $resolvedCommitOutput) { "$resolvedCommitOutput".Trim() } else { $null }
+      if ($resolvedCommitExitCode -ne 0 -or $resolvedCommit -notmatch '^[0-9a-f]{40}$') {
         throw "Failed to resolve ordered commit '$orderedCommit'."
       }
 

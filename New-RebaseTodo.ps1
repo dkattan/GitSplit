@@ -43,15 +43,19 @@ function Get-TodoCommandInfo {
   return $null
 }
 
-$resolvedFrom = (git rev-parse $From).Trim()
-if ($LASTEXITCODE -ne 0 -or $resolvedFrom -notmatch '^[0-9a-f]{40}$') {
+$resolvedFromOutput = git rev-parse $From
+$resolvedFromExitCode = $LASTEXITCODE
+$resolvedFrom = if ($resolvedFromExitCode -eq 0 -and $null -ne $resolvedFromOutput) { "$resolvedFromOutput".Trim() } else { $null }
+if ($resolvedFromExitCode -ne 0 -or $resolvedFrom -notmatch '^[0-9a-f]{40}$') {
   throw "Failed to resolve ref '$From' to a commit SHA."
 }
 
 $orderedFullHashes = @()
 foreach ($orderedCommit in $OrderedCommits) {
-  $resolvedOrderedCommit = (git rev-parse --verify "$orderedCommit^{commit}" 2>$null).Trim()
-  if ($LASTEXITCODE -ne 0 -or $resolvedOrderedCommit -notmatch '^[0-9a-f]{40}$') {
+  $resolvedOrderedCommitOutput = git rev-parse --verify "$orderedCommit^{commit}" 2>$null
+  $resolvedOrderedCommitExitCode = $LASTEXITCODE
+  $resolvedOrderedCommit = if ($resolvedOrderedCommitExitCode -eq 0 -and $null -ne $resolvedOrderedCommitOutput) { "$resolvedOrderedCommitOutput".Trim() } else { $null }
+  if ($resolvedOrderedCommitExitCode -ne 0 -or $resolvedOrderedCommit -notmatch '^[0-9a-f]{40}$') {
     throw "Failed to resolve ordered commit '$orderedCommit' to a commit SHA."
   }
 
@@ -80,8 +84,10 @@ foreach ($todoLine in $todoLines) {
     continue
   }
 
-  $todoCommitFullHash = (git rev-parse --verify "$($commandInfo.Hash)^{commit}" 2>$null).Trim()
-  if ($LASTEXITCODE -ne 0 -or $todoCommitFullHash -notmatch '^[0-9a-f]{40}$') {
+  $todoCommitOutput = git rev-parse --verify "$($commandInfo.Hash)^{commit}" 2>$null
+  $todoCommitExitCode = $LASTEXITCODE
+  $todoCommitFullHash = if ($todoCommitExitCode -eq 0 -and $null -ne $todoCommitOutput) { "$todoCommitOutput".Trim() } else { $null }
+  if ($todoCommitExitCode -ne 0 -or $todoCommitFullHash -notmatch '^[0-9a-f]{40}$') {
     throw "Failed to resolve todo commit '$($commandInfo.Hash)' from line '$todoLine'."
   }
 
