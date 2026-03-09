@@ -582,6 +582,28 @@ Describe "GitSplit" {
       }
     }
 
+    It "returns a fallback message when a key is configured and changes exist" {
+      Push-Location $script:TempRepoPath
+      try {
+        $oldAnthropicKey = $env:AnthropicKey
+        $oldAnthropicToken = $env:ANTHROPIC_TOKEN
+        $env:AnthropicKey = 'test-key'
+        $env:ANTHROPIC_TOKEN = $null
+
+        'local-change' | Add-Content -Path 'a.txt'
+
+        $msg = Get-CommitMessageFromChanges -DiffLevel Full
+        $msg | Should -Be 'Update changes'
+
+        git checkout -- a.txt | Out-Null
+      }
+      finally {
+        $env:AnthropicKey = $oldAnthropicKey
+        $env:ANTHROPIC_TOKEN = $oldAnthropicToken
+        Pop-Location
+      }
+    }
+
     It "throws when Anthropic key is not set" {
       Push-Location $script:TempRepoPath
       try {
@@ -600,6 +622,72 @@ Describe "GitSplit" {
       finally {
         $env:AnthropicKey = $oldAnthropicKey
         $env:ANTHROPIC_TOKEN = $oldAnthropicToken
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-GitSplitAbsorb" {
+    It "returns no fixup commits when nothing is staged" {
+      Push-Location $script:TempRepoPath
+      try {
+        $from = (git rev-parse HEAD~1).Trim()
+
+        $created = @(Invoke-GitSplitAbsorb -From $from)
+
+        $created | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when unstaged changes are present" {
+      Push-Location $script:TempRepoPath
+      try {
+        $from = (git rev-parse HEAD~1).Trim()
+        'unstaged-change' | Add-Content -Path 'a.txt'
+
+        { Invoke-GitSplitAbsorb -From $from } |
+          Should -Throw -ExpectedMessage '*staged-only changes*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when a staged file has no matching commit in the selected range" {
+      Push-Location $script:TempRepoPath
+      try {
+        $from = (git rev-parse HEAD~1).Trim()
+        'brand-new' | Set-Content -Path 'z.txt'
+        git add z.txt | Out-Null
+
+        { Invoke-GitSplitAbsorb -From $from } |
+          Should -Throw -ExpectedMessage '*Could not determine absorb target commit(s)*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "creates a fixup commit for staged changes in range" {
+      Push-Location $script:TempRepoPath
+      try {
+        $from = (git rev-parse HEAD~2).Trim()
+        'absorbed-change' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+
+        $created = @(Invoke-GitSplitAbsorb -From $from)
+
+        $created | Should -HaveCount 1
+        $created[0] | Should -Match '^[0-9a-f]{40}$'
+        (git log -1 --pretty=format:%s).Trim() | Should -Match '^fixup! Modify b\.txt$'
+
+        git diff --cached --quiet
+        $LASTEXITCODE | Should -Be 0
+      }
+      finally {
         Pop-Location
       }
     }
@@ -666,6 +754,436 @@ Describe "GitSplit" {
         $cHead | Should -Be 'c-line-1-updated'
       }
       finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Add-Commit" {
+    It "inserts a patch commit before remaining commits when replaying a range" {
+      Push-Location $script:TempRepoPath
+      try {
+        $patchPath = Join-Path $script:TempRepoPath 'insert-c.patch'
+        @(
+          'diff --git a/c.txt b/c.txt'
+          'new file mode 100644'
+          '--- /dev/null'
+          '+++ b/c.txt'
+          '@@ -0,0 +1,2 @@'
+          '+c-line-1'
+          '+c-line-2'
+        ) | Set-Content -Path $patchPath
+
+        $beforeCount = [int](git rev-list --count HEAD)
+
+        Add-Commit -After 'HEAD~3' -PatchFile $patchPath -CommitMessage 'Add c.txt'
+
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be ($beforeCount + 1)
+
+        @(Get-Content -Path 'c.txt') | Should -Be @('c-line-1', 'c-line-2')
+        @(git log --reverse --format=%s HEAD~4..HEAD) | Should -Be @(
+          'Add a.txt and b.txt'
+          'Modify a.txt and b.txt'
+          'Add c.txt'
+          'Modify b.txt'
+        )
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "can append a patch commit after replaying a single commit range" {
+      Push-Location $script:TempRepoPath
+      try {
+        $patchPath = Join-Path $script:TempRepoPath 'insert-d.patch'
+        @(
+          'diff --git a/d.txt b/d.txt'
+          'new file mode 100644'
+          '--- /dev/null'
+          '+++ b/d.txt'
+          '@@ -0,0 +1,1 @@'
+          '+d-line-1'
+        ) | Set-Content -Path $patchPath
+
+        Add-Commit -RepoPath $script:TempRepoPath -After 'HEAD~1' -PatchFile $patchPath -CommitMessage 'Add d.txt'
+
+        @(Get-Content -Path 'd.txt') | Should -Be @('d-line-1')
+        @(git log --reverse --format=%s HEAD~2..HEAD) | Should -Be @(
+          'Modify b.txt'
+          'Add d.txt'
+        )
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when there are no commits to replay after the base ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        $patchPath = Join-Path $script:TempRepoPath 'unused.patch'
+        @(
+          'diff --git a/e.txt b/e.txt'
+          'new file mode 100644'
+          '--- /dev/null'
+          '+++ b/e.txt'
+          '@@ -0,0 +1,1 @@'
+          '+e-line-1'
+        ) | Set-Content -Path $patchPath
+
+        { Add-Commit -After 'HEAD' -PatchFile $patchPath -CommitMessage 'Add e.txt' } |
+          Should -Throw -ExpectedMessage '*Expected at least 1 commit to replay*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the requested patch file does not exist" {
+      Push-Location $script:TempRepoPath
+      try {
+        $missingPatch = Join-Path $script:TempRepoPath 'missing.patch'
+        { Add-Commit -After 'HEAD~1' -PatchFile $missingPatch -CommitMessage 'Missing patch' } |
+          Should -Throw -ExpectedMessage '*Patch file not found*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-RebaseTodo" {
+    It "reorders grouped todo lines and appends non-command lines" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $commitB = (git rev-parse HEAD~1).Trim()
+        $commitC = (git rev-parse HEAD).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+
+        @(
+          "pick $commitA Add a.txt and b.txt"
+          "fixup $commitB Modify a.txt and b.txt"
+          "# keep-this-comment"
+          "merge -C $commitC Modify b.txt"
+        ) | Set-Content -Path $todoPath
+
+        & $scriptPath -Path $todoPath -From 'HEAD~3' -OrderedCommits @(" $commitC ", $commitA, $commitA)
+
+        @(Get-Content -Path $todoPath) | Should -Be @(
+          "merge -C $commitC Modify b.txt"
+          "pick $commitA Add a.txt and b.txt"
+          "fixup $commitB Modify a.txt and b.txt"
+          '# keep-this-comment'
+        )
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "returns without rewriting when no ordered commits are provided" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+        $originalLines = @(
+          "pick $commitA Add a.txt and b.txt"
+          '# unchanged-comment'
+        )
+
+        $originalLines | Set-Content -Path $todoPath
+
+        & $scriptPath -Path $todoPath -From 'HEAD~3'
+
+        @(Get-Content -Path $todoPath) | Should -Be $originalLines
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "returns when the todo path does not exist" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $missingPath = Join-Path $script:TempRepoPath 'missing-todo'
+
+        { & $scriptPath -Path $missingPath -From 'HEAD~3' -OrderedCommits @($commitA) } | Should -Not -Throw
+        Test-Path -LiteralPath $missingPath | Should -BeFalse
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the from ref cannot be resolved" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+        "pick $commitA Add a.txt and b.txt" | Set-Content -Path $todoPath
+
+        { & $scriptPath -Path $todoPath -From 'not-a-real-ref' -OrderedCommits @($commitA) } |
+          Should -Throw -ExpectedMessage "*Failed to resolve ref 'not-a-real-ref'*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when an ordered commit cannot be resolved" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+        "pick $commitA Add a.txt and b.txt" | Set-Content -Path $todoPath
+
+        { & $scriptPath -Path $todoPath -From 'HEAD~3' -OrderedCommits @('deadbee') } |
+          Should -Throw -ExpectedMessage "*Failed to resolve ordered commit 'deadbee'*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the todo file references an unresolved commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+
+        @(
+          'pick deadbee Missing commit'
+          "pick $commitA Add a.txt and b.txt"
+        ) | Set-Content -Path $todoPath
+
+        { & $scriptPath -Path $todoPath -From 'HEAD~3' -OrderedCommits @($commitA) } |
+          Should -Throw -ExpectedMessage '*Failed to resolve todo commit*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when an ordered commit is not present in the todo file" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $PSScriptRoot 'New-RebaseTodo.ps1'
+        $commitA = (git rev-parse HEAD~2).Trim()
+        $rootCommit = (git rev-list --max-parents=0 HEAD).Trim()
+        $todoPath = Join-Path $script:TempRepoPath 'git-rebase-todo'
+        "pick $commitA Add a.txt and b.txt" | Set-Content -Path $todoPath
+
+        { & $scriptPath -Path $todoPath -From 'HEAD~3' -OrderedCommits @($rootCommit) } |
+          Should -Throw -ExpectedMessage '*is not present in existing rebase todo*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Hunk guardrails" {
+    It "throws when the hunk text is empty" {
+      { Split-Hunk -Hunk '   ' -Line 1 } | Should -Throw -ExpectedMessage '*empty or invalid*'
+    }
+
+    It "throws when the hunk header is invalid" {
+      { Split-Hunk -Hunk 'not-a-valid-hunk' -Line 1 } | Should -Throw -ExpectedMessage '*valid @@ header*'
+    }
+
+    It "supports splitting a hunk by body index" {
+      $hunk = "@@ -1,2 +1,2 @@`n line-1`n+line-2`n"
+
+      $parts = Split-Hunk -Hunk $hunk -Index 1
+
+      $parts | Should -HaveCount 2
+      $parts[0] | Should -Match '(?m)^@@ -1,1 \+1,1 @@'
+      $parts[1] | Should -Match '(?m)^@@ -2,0 \+2,1 @@'
+    }
+
+    It "normalizes raw blank lines and unexpected prefixes while splitting" {
+      $hunk = "@@ -1,2 +1,2 @@`n`nxodd`n"
+
+      $parts = Split-Hunk -Hunk $hunk -Index 1
+
+      $parts | Should -HaveCount 2
+      $parts[0] | Should -BeExactly "@@ -1,1 +1,1 @@`n `n"
+      $parts[1] | Should -BeExactly "@@ -2,1 +2,1 @@`nxodd`n"
+    }
+
+    It "throws when asked to split at the start or end of the body" {
+      $hunk = "@@ -1,2 +1,2 @@`n line-1`n+line-2`n"
+
+      { Split-Hunk -Hunk $hunk -Index 0 } | Should -Throw -ExpectedMessage '*inside the hunk body*'
+      { Split-Hunk -Hunk $hunk -Index 2 } | Should -Throw -ExpectedMessage '*inside the hunk body*'
+    }
+
+    It "throws when a requested column split line cannot be located" {
+      $hunk = "@@ -1,1 +1,1 @@`n+abc`n"
+
+      { Split-Hunk -Hunk $hunk -Line 9 -Column 2 } |
+        Should -Throw -ExpectedMessage '*Could not locate NEW-file line 9 inside hunk body*'
+    }
+
+    It "throws when the target line is too short for a mid-line split" {
+      $hunk = "@@ -1,1 +1,1 @@`n+`n"
+
+      { Split-Hunk -Hunk $hunk -Line 1 -Column 2 } |
+        Should -Throw -ExpectedMessage '*too short to split*'
+    }
+
+    It "throws when the split column is outside the target line" {
+      $hunk = "@@ -1,1 +1,1 @@`n+abc`n"
+
+      { Split-Hunk -Hunk $hunk -Line 1 -Column 9 } |
+        Should -Throw -ExpectedMessage '*out of range for line content length*'
+    }
+  }
+
+  Describe "New-Hunk" {
+    It "returns a header-only hunk when no body lines are provided" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 0 -NewStart 1 -NewCount 0
+
+      $hunk | Should -Be "@@ -1,0 +1,0 @@`n"
+    }
+  }
+
+  Describe "New-Range guardrails" {
+    It "throws when the target path does not exist" {
+      $missingPath = Join-Path $script:TempRepoPath 'missing-range.txt'
+
+      { New-Range -Path $missingPath -Line 1 -Column 1 -Length 0 } |
+        Should -Throw -ExpectedMessage '*Path not found*'
+    }
+
+    It "throws when the line or index is outside the file contents" {
+      Push-Location $script:TempRepoPath
+      try {
+        $path = Join-Path $script:TempRepoPath 'range-errors.txt'
+        'abc' | Set-Content -Path $path
+
+        { New-Range -Path $path -Line 5 -Column 1 -Length 0 } |
+          Should -Throw -ExpectedMessage '*Line 5 is out of range*'
+        { New-Range -Path $path -Index 50 -Length 0 } |
+          Should -Throw -ExpectedMessage '*Index 50 is out of range*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when line and column resolve beyond the file length" {
+      Push-Location $script:TempRepoPath
+      try {
+        $path = Join-Path $script:TempRepoPath 'range-column-errors.txt'
+        'abc' | Set-Content -Path $path
+
+        { New-Range -Path $path -Line 1 -Column 20 -Length 0 } |
+          Should -Throw -ExpectedMessage '*resolves to index*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Set-CommitOrder guardrails" {
+    It "rejects an empty ordered commit list" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Set-CommitOrder -OrderedCommits @() -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage "*Cannot validate argument on parameter 'OrderedCommits'*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the working tree is dirty without -Autostash or -Absorb" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headCommit = (git rev-parse HEAD).Trim()
+        'dirty-change' | Add-Content -Path 'a.txt'
+
+        { Set-CommitOrder -OrderedCommits @($headCommit) -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*Working tree is not clean*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when an ordered commit cannot be resolved" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Set-CommitOrder -OrderedCommits @('deadbee') -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage "*Failed to resolve ordered commit 'deadbee'*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when all ordered commits are blank after normalization" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Set-CommitOrder -OrderedCommits @('   ') -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*No valid commits were provided to reorder*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the base ref is invalid" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headCommit = (git rev-parse HEAD).Trim()
+
+        { Set-CommitOrder -OrderedCommits @($headCommit) -BaseRef 'not-a-ref' } |
+          Should -Throw -ExpectedMessage "*Base reference 'not-a-ref' is not valid*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when an ordered commit is outside the selected range" {
+      Push-Location $script:TempRepoPath
+      try {
+        $rootCommit = (git rev-list --max-parents=0 HEAD).Trim()
+
+        { Set-CommitOrder -OrderedCommits @($rootCommit) -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*outside the reorder range*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when run from a detached HEAD" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headCommit = (git rev-parse HEAD).Trim()
+
+        git checkout --detach -q HEAD 2>$null | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        { Set-CommitOrder -OrderedCommits @($headCommit) -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*detached HEAD*'
+      }
+      finally {
+        git checkout -q - 2>$null | Out-Null
         Pop-Location
       }
     }
