@@ -637,10 +637,12 @@ function New-MoveCommitPlan {
   $useRemoteTrackingBranch = $remoteBranchExists -and -not $branchExists
   $plannedStashName = New-GitSplitStashName -Operation 'move-commit'
   $plannedDestWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
+  $plannedSourceWorktreePath = $null
 
   $sourceRemovalPlan = $null
   if ($RemoveFromSource) {
     $sourceRemovalPlan = New-CommitRemovalRewritePlan -CommitHash $commitHash -Branch $currentBranch -Push:$Push -ForcePush:$ForcePushSource
+    $plannedSourceWorktreePath = "$plannedDestWorktreePath-source"
   }
 
   $steps = @()
@@ -666,6 +668,13 @@ function New-MoveCommitPlan {
     '$destWorktreeCreated = $false'
     '$moveSucceeded = $false'
   )
+
+  if ($sourceRemovalPlan) {
+    $steps += New-GitStep -Kind Literal -Lines @(
+      '$sourceWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedSourceWorktreePath)
+      '$sourceWorktreeCreated = $false'
+    )
+  }
 
   $steps += New-GitStep -Kind Comment -Lines @(
     'Runtime guards: assert repository, branch, head commit, destination branch availability, and working tree expectations.'
@@ -754,23 +763,46 @@ function New-MoveCommitPlan {
 
   if ($sourceRemovalPlan) {
     $executionLines += ''
-    $executionLines += '  # Remove the moved commit from the source branch using the strategy chosen at plan time.'
+    $executionLines += '  # Remove the moved commit from the source branch using a detached worktree, then resync the checked-out branch.'
+    $executionLines += @(
+      '  if (Test-Path -LiteralPath $sourceWorktreePath) {'
+      '    throw "Planned source worktree path ''$sourceWorktreePath'' already exists."'
+      '  }'
+      '  & git worktree add --detach $sourceWorktreePath $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git worktree add --detach failed for source branch $expectedBranch"'
+      '  }'
+      '  $sourceWorktreeCreated = $true'
+    )
+
     if ($sourceRemovalPlan.Mode -eq 'ResetToParent') {
       $executionLines += @(
-        '  & git reset --hard ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-        '  if ($LASTEXITCODE -ne 0) {'
-        '    throw "git reset --hard failed while removing $commitHash from $expectedBranch"'
-        '  }'
+        '  $rewrittenHead = ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash)
       )
     }
     else {
       $executionLines += @(
-        '  & git rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  & git -C $sourceWorktreePath rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
         '  if ($LASTEXITCODE -ne 0) {'
-        '    throw "git rebase --onto failed while removing $commitHash from $expectedBranch"'
+        '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"'
+        '  }'
+        '  $rewrittenHead = (& git -C $sourceWorktreePath rev-parse HEAD).Trim()'
+        '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {'
+        '    throw "Failed to resolve rewritten source head for $expectedBranch."'
         '  }'
       )
     }
+
+    $executionLines += @(
+      '  & git update-ref "refs/heads/$expectedBranch" $rewrittenHead $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git update-ref failed while rewriting $expectedBranch"'
+      '  }'
+      '  & git reset --hard "refs/heads/$expectedBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git reset --hard failed while synchronizing $expectedBranch"'
+      '  }'
+    )
 
     if ($sourceRemovalPlan.Push) {
       if ($sourceRemovalPlan.ForcePush) {
@@ -796,6 +828,24 @@ function New-MoveCommitPlan {
     '  $moveSucceeded = $true'
     '}'
     'finally {'
+  )
+
+  if ($sourceRemovalPlan) {
+    $executionLines += @(
+      '  if ($moveSucceeded -and $sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
+      '    & git worktree remove --force $sourceWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    if ($LASTEXITCODE -ne 0) {'
+      '      throw "git worktree remove --force failed for ''$sourceWorktreePath''."'
+      '    }'
+      '  }'
+      '  elseif ($sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
+      '    Write-Warning "Preserving source worktree at ''$sourceWorktreePath'' so conflicts can be resolved manually."'
+      '  }'
+      ''
+    )
+  }
+
+  $executionLines += @(
     '  if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
     '    & git worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '    if ($LASTEXITCODE -ne 0) {'
@@ -2879,6 +2929,7 @@ else {
   # PowerShell effectively filters exports through BOTH lists, so keep them aligned
   # to avoid surprising "only the intersection" exports.
   Export-ModuleMember -Function @(
+    'Split-Patch'
     'Split-Commit'
     'Add-Commit'
     'Remove-Commit'

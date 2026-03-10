@@ -725,6 +725,9 @@ Describe "GitSplit" {
     It "can move HEAD~1 to another branch and remove it from the source branch" {
       Push-Location $script:TempRepoPath
       try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $sourceBranch | Should -Not -Be 'HEAD'
+
         git branch dest2 | Out-Null
         $LASTEXITCODE | Should -Be 0
 
@@ -744,6 +747,13 @@ Describe "GitSplit" {
         # Move the *previous* commit (non-HEAD) to dest2 and remove it from source.
         Move-Commit -CommitRef HEAD~1 -DestinationBranch 'dest2' -RemoveFromSource | Out-Null
 
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+        @(
+          git status --porcelain |
+            ForEach-Object { "$_".TrimEnd() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        ) | Should -Be @()
+
         # Source branch should no longer contain the moved commit subject,
         # but should still contain the later commit subject.
         $sourceSubjects = (git log -n 50 --pretty=format:%s) -join "`n"
@@ -755,6 +765,51 @@ Describe "GitSplit" {
         $destSubjects | Should -Match ([regex]::Escape($msgToMove))
       }
       finally {
+        Pop-Location
+      }
+    }
+
+    It "writes branch resync steps into Move-Commit scripts when removing from source" {
+      $scriptPath = $null
+      Push-Location $script:TempRepoPath
+      try {
+        git branch sync-dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'sync-line-1' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+        git commit -m "Sync move $(New-Guid)" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'sync-line-2' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m "Sync keep $(New-Guid)" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        $fixedGuid = '11111111-2222-3333-4444-555555555555'
+        Set-GitSplitTestHooks -GuidProvider ({ $fixedGuid }.GetNewClosure())
+
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("move-commit-sync-" + (New-Guid) + ".ps1")
+        if (Test-Path $scriptPath) {
+          Remove-Item -Path $scriptPath -Force
+        }
+
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'sync-dest' -RemoveFromSource -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $expectedDestWorktreePath = Join-Path (Join-Path $script:TempRepoPath '.gitsplit-worktrees') $fixedGuid
+        $expectedSourceWorktreePath = "$expectedDestWorktreePath-source"
+
+        $scriptText | Should -Match ([regex]::Escape("`$sourceWorktreePath = '$expectedSourceWorktreePath'"))
+        $scriptText | Should -Match ([regex]::Escape('& git worktree add --detach $sourceWorktreePath $expectedBranch'))
+        $scriptText | Should -Match ([regex]::Escape('& git update-ref "refs/heads/$expectedBranch" $rewrittenHead $expectedHead'))
+        $scriptText | Should -Match ([regex]::Escape('& git reset --hard "refs/heads/$expectedBranch"'))
+      }
+      finally {
+        Reset-GitSplitTestHooks
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+          Remove-Item -Path $scriptPath -Force
+        }
         Pop-Location
       }
     }
