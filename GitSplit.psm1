@@ -83,6 +83,852 @@ function Invoke-WithProgressSuppressed {
   }
 }
 
+function Invoke-GitQuery {
+  [CmdletBinding()]
+  param(
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    [Parameter()]
+    [switch]$AllowFailure,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$GitArgs
+  )
+
+  $records = @(
+    & git @GitArgs 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.ToString()
+          }
+          else {
+            "$_"
+          }
+        }
+      }
+  )
+
+  $exitCode = $LASTEXITCODE
+  $output = ($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+
+  if ($exitCode -ne 0 -and -not $AllowFailure) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "git $($GitArgs -join ' ')" }
+    if ([string]::IsNullOrWhiteSpace($output)) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+
+    throw "$ctx failed with exit code $exitCode`n$output"
+  }
+
+  return [PSCustomObject]@{
+    ExitCode = $exitCode
+    Output   = $output
+    Lines    = $records
+  }
+}
+
+function Get-GitRepoRoot {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $repoRoot = (Invoke-GitQuery -ErrorMessage 'Move-Commit must be run inside a git repository.' rev-parse --show-toplevel).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($repoRoot)) {
+    throw "Move-Commit must be run inside a git repository."
+  }
+
+  return $repoRoot
+}
+
+function Get-GitCurrentBranch {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $currentBranch = (Invoke-GitQuery -ErrorMessage 'Failed to get current branch.' rev-parse --abbrev-ref HEAD).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($currentBranch)) {
+    throw "Failed to get current branch."
+  }
+
+  return $currentBranch
+}
+
+function Resolve-GitCommit {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter()]
+    [string]$ErrorMessage
+  )
+
+  if (-not $ErrorMessage) {
+    $ErrorMessage = "Failed to resolve commit reference '$Ref'."
+  }
+
+  $resolvedCommit = (Invoke-GitQuery -ErrorMessage $ErrorMessage rev-parse --verify "$Ref^{commit}").Output.Trim()
+  if ($resolvedCommit -notmatch '^[0-9a-f]{40}$') {
+    throw $ErrorMessage
+  }
+
+  return $resolvedCommit
+}
+
+function Test-GitRefExists {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref
+  )
+
+  $query = Invoke-GitQuery -AllowFailure -GitArgs @('show-ref', '--verify', '--quiet', $Ref)
+  if ($query.ExitCode -eq 0) {
+    return $true
+  }
+
+  if ($query.ExitCode -eq 1) {
+    return $false
+  }
+
+  if ([string]::IsNullOrWhiteSpace($query.Output)) {
+    throw "Failed to inspect git ref '$Ref'."
+  }
+
+  throw "Failed to inspect git ref '$Ref'.`n$($query.Output)"
+}
+
+function Test-GitCommitIsAncestor {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ancestor,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Descendant
+  )
+
+  $query = Invoke-GitQuery -AllowFailure -GitArgs @('merge-base', '--is-ancestor', $Ancestor, $Descendant)
+  if ($query.ExitCode -eq 0) {
+    return $true
+  }
+
+  if ($query.ExitCode -eq 1) {
+    return $false
+  }
+
+  if ([string]::IsNullOrWhiteSpace($query.Output)) {
+    throw "Failed to determine whether '$Ancestor' is an ancestor of '$Descendant'."
+  }
+
+  throw "Failed to determine whether '$Ancestor' is an ancestor of '$Descendant'.`n$($query.Output)"
+}
+
+function ConvertTo-PowerShellStringLiteral {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [AllowNull()]
+    [string]$Value
+  )
+
+  if ($null -eq $Value) {
+    return '$null'
+  }
+
+  return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function ConvertTo-PowerShellHereStringLines {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$AssignmentPrefix,
+
+    [Parameter()]
+    [AllowEmptyString()]
+    [string]$Value = ''
+  )
+
+  $normalizedValue = $Value -replace "`r`n", "`n"
+  $lines = @("$AssignmentPrefix@'")
+  if (-not [string]::IsNullOrEmpty($normalizedValue)) {
+    $lines += $normalizedValue.TrimEnd("`n") -split "`n"
+  }
+  $lines += "'@"
+  return $lines
+}
+
+$script:GitSplitTestHooks = @{
+  GuidProvider      = $null
+  TempRootProvider  = $null
+  TimestampProvider = $null
+  StashNameProvider = $null
+}
+
+function Set-GitSplitTestHooks {
+  [CmdletBinding()]
+  param(
+    [Parameter()]
+    [AllowNull()]
+    [scriptblock]$GuidProvider,
+
+    [Parameter()]
+    [AllowNull()]
+    [scriptblock]$TempRootProvider,
+
+    [Parameter()]
+    [AllowNull()]
+    [scriptblock]$TimestampProvider,
+
+    [Parameter()]
+    [AllowNull()]
+    [scriptblock]$StashNameProvider
+  )
+
+  foreach ($providerName in @('GuidProvider', 'TempRootProvider', 'TimestampProvider', 'StashNameProvider')) {
+    if ($PSBoundParameters.ContainsKey($providerName)) {
+      $script:GitSplitTestHooks[$providerName] = $PSBoundParameters[$providerName]
+    }
+  }
+}
+
+function Reset-GitSplitTestHooks {
+  [CmdletBinding()]
+  param()
+
+  foreach ($providerName in @('GuidProvider', 'TempRootProvider', 'TimestampProvider', 'StashNameProvider')) {
+    $script:GitSplitTestHooks[$providerName] = $null
+  }
+}
+
+function Get-GitSplitGuid {
+  [CmdletBinding()]
+  [OutputType([guid])]
+  param()
+
+  if ($script:GitSplitTestHooks.GuidProvider) {
+    $providedValue = & $script:GitSplitTestHooks.GuidProvider
+    if ($providedValue -is [guid]) {
+      return $providedValue
+    }
+
+    $parsedGuid = [guid]::Empty
+    if ([guid]::TryParse("$providedValue", [ref]$parsedGuid)) {
+      return $parsedGuid
+    }
+
+    throw "GitSplit test Guid provider must return a valid Guid value."
+  }
+
+  return [guid]::NewGuid()
+}
+
+function Get-GitSplitTimestamp {
+  [CmdletBinding()]
+  [OutputType([datetime])]
+  param()
+
+  if ($script:GitSplitTestHooks.TimestampProvider) {
+    $providedValue = & $script:GitSplitTestHooks.TimestampProvider
+    if ($providedValue -is [datetime]) {
+      return $providedValue
+    }
+
+    $parsedTimestamp = [datetime]::MinValue
+    if ([datetime]::TryParse("$providedValue", [ref]$parsedTimestamp)) {
+      return $parsedTimestamp
+    }
+
+    throw "GitSplit test timestamp provider must return a valid DateTime value."
+  }
+
+  return Get-Date
+}
+
+function Get-GitSplitTempRoot {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $tempRoot = if ($script:GitSplitTestHooks.TempRootProvider) {
+    & $script:GitSplitTestHooks.TempRootProvider
+  }
+  else {
+    [System.IO.Path]::GetTempPath()
+  }
+
+  if ([string]::IsNullOrWhiteSpace("$tempRoot")) {
+    throw "GitSplit temp root provider returned an empty path."
+  }
+
+  return "$tempRoot"
+}
+
+function New-GitSplitTempFilePath {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Prefix = 'gitsplit-temp',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Extension = '.tmp'
+  )
+
+  $guid = (Get-GitSplitGuid).ToString('N')
+  return Join-Path (Get-GitSplitTempRoot) ("$Prefix-$guid$Extension")
+}
+
+function New-GitSplitStashName {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Operation = 'operation'
+  )
+
+  $stashName = if ($script:GitSplitTestHooks.StashNameProvider) {
+    & $script:GitSplitTestHooks.StashNameProvider $Operation
+  }
+  else {
+    "gitsplit-$Operation-$((Get-GitSplitTimestamp).ToString('yyyyMMddHHmmss'))"
+  }
+
+  if ([string]::IsNullOrWhiteSpace("$stashName")) {
+    throw "GitSplit stash name provider returned an empty value."
+  }
+
+  return "$stashName"
+}
+
+function New-GitSplitWorktreePath {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$RepoRoot
+  )
+
+  $worktreeRoot = Join-Path $RepoRoot '.gitsplit-worktrees'
+  return Join-Path $worktreeRoot ((Get-GitSplitGuid).ToString())
+}
+
+function New-GitStep {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Comment', 'Literal')]
+    [string]$Kind,
+
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [AllowEmptyString()]
+    [string[]]$Lines
+  )
+
+  return [PSCustomObject]@{
+    Kind  = $Kind
+    Lines = @($Lines)
+  }
+}
+
+function New-GitPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Name,
+
+    [Parameter()]
+    [hashtable]$Metadata,
+
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [object[]]$Steps
+  )
+
+  return [PSCustomObject]@{
+    Name     = $Name
+    Metadata = $Metadata
+    Steps    = @($Steps)
+  }
+}
+
+function ConvertTo-GitScript {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [psobject]$Plan
+  )
+
+  $lines = @(
+    "# Generated by GitSplit: $($Plan.Name)"
+    'Set-StrictMode -Version Latest'
+    '$ErrorActionPreference = ''Stop'''
+    ''
+  )
+
+  foreach ($step in $Plan.Steps) {
+    switch ($step.Kind) {
+      'Comment' {
+        foreach ($commentLine in @($step.Lines)) {
+          if ([string]::IsNullOrWhiteSpace($commentLine)) {
+            $lines += '#'
+          }
+          else {
+            $lines += '# ' + $commentLine
+          }
+        }
+      }
+
+      'Literal' {
+        $lines += @($step.Lines)
+      }
+
+      default {
+        throw "Unsupported git plan step kind '$($step.Kind)'."
+      }
+    }
+
+    $lines += ''
+  }
+
+  return (($lines -join "`n").TrimEnd()) + "`n"
+}
+
+function Write-GitScript {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [psobject]$Plan,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path
+  )
+
+  $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+  $parentPath = Split-Path -Parent $resolvedPath
+  if (-not [string]::IsNullOrWhiteSpace($parentPath) -and -not (Test-Path -LiteralPath $parentPath)) {
+    New-Item -Path $parentPath -ItemType Directory -Force | Out-Null
+  }
+
+  Set-Content -Path $resolvedPath -Value (ConvertTo-GitScript -Plan $Plan)
+  return $resolvedPath
+}
+
+function Invoke-GitPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [psobject]$Plan
+  )
+
+  $scriptBlock = [scriptblock]::Create((ConvertTo-GitScript -Plan $Plan))
+  return & $scriptBlock
+}
+
+function New-CommitRemovalRewritePlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$CommitHash,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Branch,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePush
+  )
+
+  if (-not (Test-GitCommitIsAncestor -Ancestor $CommitHash -Descendant $Branch)) {
+    throw "Commit $CommitHash is not an ancestor of branch '$Branch'."
+  }
+
+  $branchHead = Resolve-GitCommit -Ref $Branch -ErrorMessage "Failed to resolve branch '$Branch'."
+  $parentHash = Resolve-GitCommit -Ref "$CommitHash^" -ErrorMessage "Cannot remove the initial commit."
+
+  if ($branchHead -eq $CommitHash) {
+    return [PSCustomObject]@{
+      Mode       = 'ResetToParent'
+      Branch     = $Branch
+      BranchHead = $branchHead
+      CommitHash = $CommitHash
+      ParentHash = $parentHash
+      Push       = [bool]$Push
+      ForcePush  = [bool]$ForcePush
+    }
+  }
+
+  return [PSCustomObject]@{
+    Mode       = 'RebaseOntoParent'
+    Branch     = $Branch
+    BranchHead = $branchHead
+    CommitHash = $CommitHash
+    ParentHash = $parentHash
+    Push       = [bool]$Push
+    ForcePush  = [bool]$ForcePush
+  }
+}
+
+function New-MoveCommitPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
+    [string]$CommitRef,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$DestinationBranch,
+
+    [Parameter()]
+    [switch]$RemoveFromSource,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePushSource,
+
+    [Parameter()]
+    [switch]$AutoStash
+  )
+
+  $repoRoot = Get-GitRepoRoot
+  $currentBranch = Get-GitCurrentBranch
+  if ($currentBranch -eq 'HEAD') {
+    throw "You are in a detached HEAD state. Checkout a branch before calling Move-Commit."
+  }
+
+  $currentHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+  $commitHash = Resolve-GitCommit -Ref $CommitRef -ErrorMessage "Failed to resolve commit reference '$CommitRef'."
+
+  $branchExists = Test-GitRefExists -Ref "refs/heads/$DestinationBranch"
+  $remoteBranchExists = Test-GitRefExists -Ref "refs/remotes/origin/$DestinationBranch"
+  if (-not $branchExists -and -not $remoteBranchExists) {
+    throw "Destination branch '$DestinationBranch' does not exist locally or on origin. Create it first."
+  }
+
+  $destinationRef = if ($branchExists) { "refs/heads/$DestinationBranch" } else { "refs/remotes/origin/$DestinationBranch" }
+  $useRemoteTrackingBranch = $remoteBranchExists -and -not $branchExists
+  $plannedStashName = New-GitSplitStashName -Operation 'move-commit'
+  $plannedDestWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
+  $plannedSourceWorktreePath = $null
+
+  $sourceRemovalPlan = $null
+  if ($RemoveFromSource) {
+    $sourceRemovalPlan = New-CommitRemovalRewritePlan -CommitHash $commitHash -Branch $currentBranch -Push:$Push -ForcePush:$ForcePushSource
+    $plannedSourceWorktreePath = "$plannedDestWorktreePath-source"
+  }
+
+  $steps = @()
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Move-Commit execution plan.',
+    'Discovery-time values are frozen below; runtime checks ensure the repository has not drifted.'
+  )
+
+  $steps += New-GitStep -Kind Literal -Lines @(
+    '$expectedRepoRoot = ' + (ConvertTo-PowerShellStringLiteral $repoRoot)
+    '$expectedBranch = ' + (ConvertTo-PowerShellStringLiteral $currentBranch)
+    '$expectedHead = ' + (ConvertTo-PowerShellStringLiteral $currentHead)
+    '$commitHash = ' + (ConvertTo-PowerShellStringLiteral $commitHash)
+    '$destinationBranch = ' + (ConvertTo-PowerShellStringLiteral $DestinationBranch)
+    '$destinationRef = ' + (ConvertTo-PowerShellStringLiteral $destinationRef)
+    '$useRemoteTrackingBranch = ' + $(if ($useRemoteTrackingBranch) { '$true' } else { '$false' })
+    '$autoStash = ' + $(if ($AutoStash) { '$true' } else { '$false' })
+    '$pushDestination = ' + $(if ($Push) { '$true' } else { '$false' })
+    '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
+    '$destWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedDestWorktreePath)
+    '$stashed = $false'
+    '$stashName = $null'
+    '$destWorktreeCreated = $false'
+    '$moveSucceeded = $false'
+  )
+
+  if ($sourceRemovalPlan) {
+    $steps += New-GitStep -Kind Literal -Lines @(
+      '$sourceWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedSourceWorktreePath)
+      '$sourceWorktreeCreated = $false'
+    )
+  }
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Runtime guards: assert repository, branch, head commit, destination branch availability, and working tree expectations.'
+  )
+
+  $guardLines = @(
+    '$repoRoot = (& git rev-parse --show-toplevel).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {'
+    '  throw "Move-Commit must be run inside a git repository."'
+    '}'
+    'if ($repoRoot -ne $expectedRepoRoot) {'
+    '  throw "This script was generated for repo root ''$expectedRepoRoot'' but is running in ''$repoRoot''."'
+    '}'
+    '$currentBranch = (& git rev-parse --abbrev-ref HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {'
+    '  throw "Failed to get current branch."'
+    '}'
+    'if ($currentBranch -ne $expectedBranch) {'
+    '  throw "This script expected branch ''$expectedBranch'' but found ''$currentBranch''."'
+    '}'
+    '$currentHead = (& git rev-parse HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or $currentHead -notmatch ''^[0-9a-f]{40}$'') {'
+    '  throw "Failed to resolve HEAD."'
+    '}'
+    'if ($currentHead -ne $expectedHead) {'
+    '  throw "This script expected HEAD ''$expectedHead'' but found ''$currentHead''."'
+    '}'
+    '& git show-ref --verify --quiet $destinationRef'
+    'if ($LASTEXITCODE -ne 0) {'
+    '  if ($useRemoteTrackingBranch) {'
+    '    throw "Destination branch ''$destinationBranch'' no longer exists on origin."'
+    '  }'
+    '  throw "Destination branch ''$destinationBranch'' no longer exists locally."'
+    '}'
+    '$status = @(& git status --porcelain)'
+    'if ($LASTEXITCODE -ne 0) {'
+    '  throw "Failed to determine git status."'
+    '}'
+    'if ($status.Count -gt 0) {'
+    '  if (-not $autoStash) {'
+    '    throw "Uncommitted changes detected. Re-run with -AutoStash, or commit/stash your changes before running this script."'
+    '  }'
+    '  $stashName = $plannedStashName'
+    '  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) {'
+    '    throw "git stash push failed"'
+    '  }'
+    '  $stashed = $true'
+    '}'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $guardLines
+
+  $executionLines = @(
+    '$wtRoot = Join-Path $repoRoot ''.gitsplit-worktrees'''
+    'if (-not (Test-Path -LiteralPath $wtRoot)) {'
+    '  New-Item -Path $wtRoot -ItemType Directory -Force | Out-Null'
+    '}'
+    'if (Test-Path -LiteralPath $destWorktreePath) {'
+    '  throw "Planned destination worktree path ''$destWorktreePath'' already exists."'
+    '}'
+    'try {'
+    '  if ($useRemoteTrackingBranch) {'
+    '    & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git worktree add -b $destinationBranch failed"'
+    '    }'
+    '  }'
+    '  else {'
+    '    & git worktree add $destWorktreePath $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git worktree add $destinationBranch failed"'
+    '    }'
+    '  }'
+    '  $destWorktreeCreated = $true'
+    '  & git -C $destWorktreePath cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) {'
+    '    throw "git -C <worktree> cherry-pick failed for $commitHash"'
+    '  }'
+    '  if ($pushDestination) {'
+    '    & git -C $destWorktreePath push -u origin $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git -C <worktree> push failed for $destinationBranch"'
+    '    }'
+    '  }'
+  )
+
+  if ($sourceRemovalPlan) {
+    $executionLines += ''
+    $executionLines += '  # Remove the moved commit from the source branch using a detached worktree, then resync the checked-out branch.'
+    $executionLines += @(
+      '  if (Test-Path -LiteralPath $sourceWorktreePath) {'
+      '    throw "Planned source worktree path ''$sourceWorktreePath'' already exists."'
+      '  }'
+      '  & git worktree add --detach $sourceWorktreePath $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git worktree add --detach failed for source branch $expectedBranch"'
+      '  }'
+      '  $sourceWorktreeCreated = $true'
+    )
+
+    if ($sourceRemovalPlan.Mode -eq 'ResetToParent') {
+      $executionLines += @(
+        '  $rewrittenHead = ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash)
+      )
+    }
+    else {
+      $executionLines += @(
+        '  & git -C $sourceWorktreePath rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  if ($LASTEXITCODE -ne 0) {'
+        '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"'
+        '  }'
+        '  $rewrittenHead = (& git -C $sourceWorktreePath rev-parse HEAD).Trim()'
+        '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {'
+        '    throw "Failed to resolve rewritten source head for $expectedBranch."'
+        '  }'
+      )
+    }
+
+    $executionLines += @(
+      '  & git update-ref "refs/heads/$expectedBranch" $rewrittenHead $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git update-ref failed while rewriting $expectedBranch"'
+      '  }'
+      '  & git reset --hard "refs/heads/$expectedBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git reset --hard failed while synchronizing $expectedBranch"'
+      '  }'
+    )
+
+    if ($sourceRemovalPlan.Push) {
+      if ($sourceRemovalPlan.ForcePush) {
+        $executionLines += @(
+          '  & git push --force-with-lease origin $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+          '  if ($LASTEXITCODE -ne 0) {'
+          '    throw "git push --force-with-lease origin $expectedBranch failed"'
+          '  }'
+        )
+      }
+      else {
+        $executionLines += @(
+          '  & git push origin $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+          '  if ($LASTEXITCODE -ne 0) {'
+          '    throw "git push origin $expectedBranch failed"'
+          '  }'
+        )
+      }
+    }
+  }
+
+  $executionLines += @(
+    '  $moveSucceeded = $true'
+    '}'
+    'finally {'
+  )
+
+  if ($sourceRemovalPlan) {
+    $executionLines += @(
+      '  if ($moveSucceeded -and $sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
+      '    & git worktree remove --force $sourceWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    if ($LASTEXITCODE -ne 0) {'
+      '      throw "git worktree remove --force failed for ''$sourceWorktreePath''."'
+      '    }'
+      '  }'
+      '  elseif ($sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
+      '    Write-Warning "Preserving source worktree at ''$sourceWorktreePath'' so conflicts can be resolved manually."'
+      '  }'
+      ''
+    )
+  }
+
+  $executionLines += @(
+    '  if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
+    '    & git worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git worktree remove --force failed for ''$destWorktreePath''."'
+    '    }'
+    '  }'
+    '  elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
+    '    Write-Warning "Preserving destination worktree at ''$destWorktreePath'' so conflicts can be resolved manually."'
+    '  }'
+    ''
+    '  if ($stashed) {'
+    '    $gitDir = (& git rev-parse --git-dir).Trim()'
+    '    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitDir)) {'
+    '      throw "Move-Commit created a stash ''$stashName'' but failed to resolve the git directory for restoration."'
+    '    }'
+    ''
+    '    if (-not [System.IO.Path]::IsPathRooted($gitDir)) {'
+    '      $gitDir = Join-Path $repoRoot $gitDir'
+    '    }'
+    ''
+    '    $stashLines = @(& git stash list --format="%gd %s")'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "Move-Commit created a stash ''$stashName'' but failed to inspect the stash list for restoration."'
+    '    }'
+    ''
+    '    $stashLine = $stashLines | Where-Object { $_ -like "*$stashName*" } | Select-Object -First 1'
+    '    if ([string]::IsNullOrWhiteSpace($stashLine)) {'
+    '      throw "Move-Commit created a stash ''$stashName'' but could not find it for restoration."'
+    '    }'
+    ''
+    '    $stashRef = ($stashLine -split ''\s+'', 2)[0]'
+    '    $inProgress = ('
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-apply'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-merge'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''MERGE_HEAD'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''CHERRY_PICK_HEAD'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''REVERT_HEAD''))'
+    '    )'
+    ''
+    '    if ($inProgress) {'
+    '      Write-Error @('
+    '        "Move-Commit created a stash (''$stashName'' -> $stashRef) but will NOT restore it because git reports an in-progress operation (merge/rebase/cherry-pick/revert)."'
+    '        ""'
+    '        "How to proceed:"'
+    '        "  1) Inspect state:            git status"'
+    '        "  2) Finish or abort operation: git rebase --continue | git rebase --abort | git merge --abort | git cherry-pick --abort | git revert --abort"'
+    '        "  3) Then restore your changes: git stash pop $stashRef"'
+    '        ""'
+    '        "How to undo the branch rewrite (if you used -RemoveFromSource):"'
+    '        "  - Find the pre-rewrite commit in reflog: git reflog"'
+    '        "  - Reset branch back to it:              git reset --hard <sha>"'
+    '        "  - If you pushed/force-pushed:           git push --force-with-lease"'
+    '      ) -join [Environment]::NewLine'
+    '    }'
+    '    else {'
+    '      & git stash pop $stashRef 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '      if ($LASTEXITCODE -ne 0) {'
+    '        throw "Failed to restore stash $stashRef created by Move-Commit."'
+    '      }'
+    '    }'
+    '  }'
+    '}'
+    '$destinationBranch'
+  )
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Execute the destination cherry-pick in an isolated worktree, then optionally rewrite the source branch.',
+    'Cleanup removes successful temporary worktrees and preserves conflicted ones for manual resolution.'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $executionLines
+
+  return New-GitPlan -Name 'Move-Commit' -Metadata @{
+    CommitHash          = $commitHash
+    DestinationBranch   = $DestinationBranch
+    SourceBranch        = $currentBranch
+    SourceHead          = $currentHead
+    RemoveFromSource    = [bool]$RemoveFromSource
+    PushDestination     = [bool]$Push
+    AutoStash           = [bool]$AutoStash
+    OutputScriptCapable = $true
+  } -Steps $steps
+}
+
 function Split-Patch {
   <#
   .SYNOPSIS
@@ -634,6 +1480,372 @@ function New-Range {
   return $obj
 }
 
+function Get-GitFileDiffSection {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$CombinedPatch,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$FilePath
+  )
+
+  $parts = $CombinedPatch -split '(?m)^diff --git '
+  if ($parts[0] -eq '') {
+    if ($parts.Length -eq 1) {
+      return $null
+    }
+
+    $parts = $parts[1..($parts.Length - 1)]
+  }
+
+  foreach ($part in $parts) {
+    if ([string]::IsNullOrWhiteSpace($part)) {
+      continue
+    }
+
+    $section = "diff --git $part"
+    $escapedFilePath = [regex]::Escape($FilePath)
+    if ($section -match "(?m)^diff --git a/$escapedFilePath b/$escapedFilePath$") {
+      return $section
+    }
+
+    if ($section -match 'a/(.+?)\s+b/' -and $matches[1] -eq $FilePath) {
+      return $section
+    }
+  }
+
+  return $null
+}
+
+function New-SplitCommitPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter(Mandatory = $true)]
+    [object[]]$NewCommitRanges
+  )
+
+  $repoRoot = (Invoke-GitQuery -ErrorMessage 'Split-Commit must be run inside a git repository.' rev-parse --show-toplevel).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($repoRoot)) {
+    throw 'Split-Commit must be run inside a git repository.'
+  }
+
+  $currentRef = (Invoke-GitQuery -ErrorMessage 'Failed to get current ref.' rev-parse --abbrev-ref HEAD).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($currentRef)) {
+    throw 'Failed to get current ref.'
+  }
+
+  $oldHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Unable to determine HEAD.'
+  $target = Resolve-GitCommit -Ref $Ref -ErrorMessage "Unable to resolve Ref '$Ref'."
+  $parent = Resolve-GitCommit -Ref "$target^" -ErrorMessage "Unable to resolve parent for Ref '$Ref' ($target)."
+
+  $subjectQuery = Invoke-GitQuery -AllowFailure -GitArgs @('log', '-1', '--pretty=format:%s', $target)
+  $subject = if ($subjectQuery.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($subjectQuery.Output)) {
+    $subjectQuery.Output.Trim()
+  }
+  else {
+    "Split $target"
+  }
+
+  $afterTargetQuery = Invoke-GitQuery -ErrorMessage "git rev-list failed for range $target..$oldHead" -GitArgs @('rev-list', '--reverse', "$target..$oldHead")
+  $afterTarget = @(
+    $afterTargetQuery.Lines |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+
+  $patchLines = @(
+    & git show --pretty=format: --no-color $target 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.ToString()
+          }
+          else {
+            "$_"
+          }
+        }
+      }
+  )
+  $patchExitCode = $LASTEXITCODE
+  $patchText = $patchLines -join "`n"
+  if ($patchExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($patchText)) {
+    throw "git show failed to produce patch for $target."
+  }
+
+  $filePatches = Split-Patch -patch $patchText
+  if (-not $filePatches -or $filePatches.Count -eq 0) {
+    throw "No file patches found in commit $target."
+  }
+
+  $rangesByPath = @{}
+  foreach ($range in $NewCommitRanges) {
+    if ($null -eq $range) {
+      continue
+    }
+
+    $path = $range.Path
+    if (-not $path) {
+      throw 'NewCommitRanges elements must include Path.'
+    }
+
+    if (-not $rangesByPath.ContainsKey($path)) {
+      $rangesByPath[$path] = @()
+    }
+
+    $rangesByPath[$path] += $range
+  }
+
+  $perFilePieces = @{}
+  foreach ($filePatch in $filePatches) {
+    $path = $filePatch.FilePath
+    $hunks = @($filePatch.Patches)
+    $splitPoints = @()
+    if ($rangesByPath.ContainsKey($path)) {
+      $splitPoints = @($rangesByPath[$path] | Where-Object { $_.Line } | Sort-Object { [int]$_.Line })
+    }
+
+    if ($splitPoints.Count -gt 0 -and $hunks.Count -ne 1) {
+      throw "Split-Commit currently supports splitting only files with exactly 1 hunk. File '$path' has $($hunks.Count)."
+    }
+
+    if ($splitPoints.Count -eq 0) {
+      $perFilePieces[$path] = @($hunks)
+      continue
+    }
+
+    $pieces = @($hunks[0])
+    foreach ($splitPoint in $splitPoints) {
+      if (-not ($splitPoint.PSObject.Properties.Name -contains 'Line') -or $null -eq $splitPoint.Line -or [string]::IsNullOrWhiteSpace([string]$splitPoint.Line)) {
+        throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
+      }
+
+      $line = [int]$splitPoint.Line
+      $column = if ($splitPoint.PSObject.Properties.Name -contains 'Column' -and $splitPoint.Column) { [int]$splitPoint.Column } else { 1 }
+      $splitResult = Split-Hunk -Hunk $pieces[-1] -Line $line -Column $column
+      if ($pieces.Count -le 1) {
+        $pieces = @($splitResult)
+      }
+      else {
+        $pieces = @($pieces[0..($pieces.Count - 2)] + $splitResult)
+      }
+    }
+
+    $perFilePieces[$path] = @($pieces)
+  }
+
+  $pieceCount = 1
+  foreach ($path in $perFilePieces.Keys) {
+    $pathPieceCount = @($perFilePieces[$path]).Count
+    if ($pathPieceCount -gt $pieceCount) {
+      $pieceCount = $pathPieceCount
+    }
+  }
+
+  $piecePlans = @()
+  for ($i = 0; $i -lt $pieceCount; $i++) {
+    $combinedPatch = ''
+    foreach ($filePatch in $filePatches) {
+      $path = $filePatch.FilePath
+      $section = Get-GitFileDiffSection -CombinedPatch $patchText -FilePath $path
+      if (-not $section) {
+        throw "Unable to locate diff section for '$path' in commit patch."
+      }
+
+      $pieces = @($perFilePieces[$path])
+      if ($i -ge $pieces.Count) {
+        continue
+      }
+
+      $pieceHunk = $pieces[$i]
+      if ($pieceHunk -notmatch '(?m)^[+-](?![+-]{2})') {
+        continue
+      }
+
+      $hunkStart = $section.IndexOf('@@')
+      if ($hunkStart -lt 0) {
+        throw "Diff section for '$path' did not contain a hunk header."
+      }
+
+      $prefix = $section.Substring(0, $hunkStart)
+      $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
+      $combinedPatch += ($prefix + $pieceHunk.TrimEnd("`r", "`n") + "`n")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($combinedPatch)) {
+      continue
+    }
+
+    $piecePlans += [PSCustomObject]@{
+      PieceNumber   = $i + 1
+      TotalPieces   = $pieceCount
+      PatchPath     = New-GitSplitTempFilePath -Prefix ("split-commit-$($i + 1)") -Extension '.patch'
+      PatchContent  = $combinedPatch
+      CommitMessage = "$subject (split $($i + 1)/$pieceCount)"
+    }
+  }
+
+  $steps = @()
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Split-Commit execution plan.',
+    'Split patch artifacts are inlined below as here-strings so the generated script is self-contained and reviewable.'
+  )
+
+  $variableLines = @(
+    '$expectedRepoRoot = ' + (ConvertTo-PowerShellStringLiteral $repoRoot)
+    '$expectedCurrentRef = ' + (ConvertTo-PowerShellStringLiteral $currentRef)
+    '$expectedOldHead = ' + (ConvertTo-PowerShellStringLiteral $oldHead)
+    '$parentCommit = ' + (ConvertTo-PowerShellStringLiteral $parent)
+    '$createdSplitCommits = New-Object System.Collections.Generic.List[string]'
+    '$keepSplitPatch = ($env:IMMYBUILD_KEEP_SPLIT_PATCH -eq ''1'') -or ($env:IMMYBUILD_KEEP_TEMPREPO -eq ''1'')'
+  )
+
+  if ($afterTarget.Count -gt 0) {
+    $variableLines += '$replayCommits = @('
+    $variableLines += @($afterTarget | ForEach-Object { '  ' + (ConvertTo-PowerShellStringLiteral $_) })
+    $variableLines += ')'
+  }
+  else {
+    $variableLines += '$replayCommits = @()'
+  }
+
+  if ($piecePlans.Count -gt 0) {
+    foreach ($piecePlan in $piecePlans) {
+      $pieceId = $piecePlan.PieceNumber
+      $variableLines += '$splitPiece' + $pieceId + 'PatchPath = ' + (ConvertTo-PowerShellStringLiteral $piecePlan.PatchPath)
+      $variableLines += '$splitPiece' + $pieceId + 'CommitMessage = ' + (ConvertTo-PowerShellStringLiteral $piecePlan.CommitMessage)
+      $variableLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix ('$splitPiece' + $pieceId + 'PatchContent = ') -Value $piecePlan.PatchContent
+    }
+
+    $variableLines += '$splitPieces = @('
+    foreach ($piecePlan in $piecePlans) {
+      $pieceId = $piecePlan.PieceNumber
+      $patchPathVariable = ('$splitPiece{0}PatchPath' -f $pieceId)
+      $patchContentVariable = ('$splitPiece{0}PatchContent' -f $pieceId)
+      $commitMessageVariable = ('$splitPiece{0}CommitMessage' -f $pieceId)
+      $variableLines += @(
+        '  @{'
+        ('    PatchPath = {0}' -f $patchPathVariable)
+        ('    PatchContent = {0}' -f $patchContentVariable)
+        ('    CommitMessage = {0}' -f $commitMessageVariable)
+        '  }'
+      )
+    }
+    $variableLines += ')'
+  }
+  else {
+    $variableLines += '$splitPieces = @()'
+  }
+
+  $steps += New-GitStep -Kind Literal -Lines $variableLines
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Runtime guards: ensure the script is run from the same repository state it was planned against.'
+  )
+
+  $steps += New-GitStep -Kind Literal -Lines @(
+    '$repoRoot = (& git rev-parse --show-toplevel).Trim()',
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {',
+    '  throw "Split-Commit must be run inside a git repository."',
+    '}',
+    'if ($repoRoot -ne $expectedRepoRoot) {',
+    '  throw "This script was generated for repo root ''$expectedRepoRoot'' but is running in ''$repoRoot''."',
+    '}',
+    '$currentRef = (& git rev-parse --abbrev-ref HEAD).Trim()',
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentRef)) {',
+    '  throw "Failed to get current ref."',
+    '}',
+    'if ($currentRef -ne $expectedCurrentRef) {',
+    '  throw "This script expected ref ''$expectedCurrentRef'' but found ''$currentRef''."',
+    '}',
+    '$currentHead = (& git rev-parse HEAD).Trim()',
+    'if ($LASTEXITCODE -ne 0 -or $currentHead -notmatch ''^[0-9a-f]{40}$'') {',
+    '  throw "Unable to determine HEAD."',
+    '}',
+    'if ($currentHead -ne $expectedOldHead) {',
+    '  throw "This script expected HEAD ''$expectedOldHead'' but found ''$currentHead''."',
+    '}'
+  )
+
+  $executionLines = @(
+    'try {',
+    '  & git reset --hard $parentCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '  if ($LASTEXITCODE -ne 0) {',
+    '    throw "git reset --hard $parentCommit failed with exit code $LASTEXITCODE"',
+    '  }',
+    '',
+    '  foreach ($splitPiece in $splitPieces) {',
+    '    $patchParent = Split-Path -Parent $splitPiece.PatchPath',
+    '    if (-not [string]::IsNullOrWhiteSpace($patchParent) -and -not (Test-Path -LiteralPath $patchParent)) {',
+    '      New-Item -Path $patchParent -ItemType Directory -Force | Out-Null',
+    '    }',
+    '    $patchContent = $splitPiece.PatchContent.TrimEnd("`r", "`n") + "`n"',
+    '    Set-Content -LiteralPath $splitPiece.PatchPath -Value $patchContent -Encoding utf8 -NoNewline',
+    '    & git apply --whitespace=nowarn --unidiff-zero $splitPiece.PatchPath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    if ($LASTEXITCODE -ne 0) {',
+    '      throw "git apply failed for split patch $($splitPiece.PatchPath)."',
+    '    }',
+    '    & git add -A 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    if ($LASTEXITCODE -ne 0) {',
+    '      throw "git add -A failed"',
+    '    }',
+    '    & git diff --cached --quiet',
+    '    if ($LASTEXITCODE -eq 0) {',
+    '      continue',
+    '    }',
+    '    & git commit -m $splitPiece.CommitMessage 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    if ($LASTEXITCODE -ne 0) {',
+    '      throw "git commit failed while creating split commit ''$($splitPiece.CommitMessage)''."',
+    '    }',
+    '    $newSha = (& git rev-parse HEAD).Trim()',
+    '    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($newSha)) {',
+    '      throw "Unable to resolve SHA for newly created split commit ''$($splitPiece.CommitMessage)''."',
+    '    }',
+    '    $createdSplitCommits.Add($newSha) | Out-Null',
+    '  }',
+    '',
+    '  foreach ($replayCommit in $replayCommits) {',
+    '    & git cherry-pick $replayCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    if ($LASTEXITCODE -ne 0) {',
+    '      throw "git cherry-pick failed for $replayCommit"',
+    '    }',
+    '  }',
+    '}',
+    'finally {',
+    '  if (-not $keepSplitPatch) {',
+    '    foreach ($splitPiece in $splitPieces) {',
+    '      if (Test-Path -LiteralPath $splitPiece.PatchPath) {',
+    '        Remove-Item -LiteralPath $splitPiece.PatchPath -Force -ErrorAction SilentlyContinue',
+    '      }',
+    '    }',
+    '  }',
+    '}',
+    '$createdSplitCommits.ToArray()'
+  )
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Reset to the target parent, materialize each inlined patch, create split commits, then replay later commits.'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $executionLines
+
+  return New-GitPlan -Name 'Split-Commit' -Metadata @{
+    CurrentRef          = $currentRef
+    OldHead             = $oldHead
+    TargetCommit        = $target
+    ParentCommit        = $parent
+    PieceCount          = $pieceCount
+    OutputScriptCapable = $true
+    PatchArtifactMode   = 'InlineHereString'
+  } -Steps $steps
+}
+
 function Split-Commit {
   <#
   .SYNOPSIS
@@ -660,6 +1872,10 @@ function Split-Commit {
     - Column : 1-based column for mid-line splitting (defaults to 1)
     - Length : currently ignored (reserved for future range splitting)
 
+  .PARAMETER OutputScriptPath
+  If specified, writes a reviewable PowerShell script with inline split patch artifacts
+  instead of executing the rewrite immediately.
+
   .OUTPUTS
   System.String[]
   An array of SHAs for the split commits created (in creation order).
@@ -676,7 +1892,7 @@ function Split-Commit {
   - Run this only on local branches (or be prepared to force push).
   - Currently supports splitting only files that have exactly one hunk in the target commit.
   #>
-  [CmdletBinding()]
+  [CmdletBinding(SupportsShouldProcess = $true)]
   [OutputType([string[]])]
   param(
     # Commit to split (commit-ish). Typically use HEAD.
@@ -691,253 +1907,26 @@ function Split-Commit {
     #  - Column (1-based; defaults to 1)
     #  - Length (currently ignored; reserved for future range splitting)
     [Parameter(Mandatory = $true)]
-    [object[]]$NewCommitRanges
+    [object[]]$NewCommitRanges,
+
+    [Parameter()]
+    [string]$OutputScriptPath
   )
 
-  $repoRoot = (git rev-parse --show-toplevel)
-  if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
-    throw "Split-Commit must be run inside a git repository."
-  }
+  $plan = New-SplitCommitPlan -Ref $Ref -NewCommitRanges $NewCommitRanges
 
-  $oldHead = (git rev-parse HEAD)
-  if ($LASTEXITCODE -ne 0 -or -not $oldHead) {
-    throw "Unable to determine HEAD."
-  }
-
-  $target = (git rev-parse $Ref)
-  if ($LASTEXITCODE -ne 0 -or -not $target) {
-    throw "Unable to resolve Ref '$Ref'."
-  }
-
-  $parent = (git rev-parse "$target^")
-  if ($LASTEXITCODE -ne 0 -or -not $parent) {
-    throw "Unable to resolve parent for Ref '$Ref' ($target)."
-  }
-
-  $subject = (git log -1 --pretty=format:%s $target)
-  if ($LASTEXITCODE -ne 0 -or -not $subject) {
-    $subject = "Split $target"
-  }
-
-  $createdSplitCommits = New-Object System.Collections.Generic.List[string]
-
-  # Collect commits after the target (if any) so we can replay them.
-  $afterTarget = @(git rev-list --reverse "$target..$oldHead")
-  if ($LASTEXITCODE -ne 0) {
-    throw "git rev-list failed for range $target..$oldHead with exit code $LASTEXITCODE"
-  }
-  if ($afterTarget.Count -eq 1 -and $afterTarget[0] -is [string] -and $afterTarget[0] -match "\r?\n") {
-    $afterTarget = $afterTarget[0] -split "\r?\n"
-  }
-  $afterTarget = @($afterTarget | Where-Object { $_ -and $_.Trim() })
-
-  # Get the patch for the commit we are splitting.
-  $patchText = @(
-    git show --pretty=format: --no-color $target
-  ) -join "`n"
-  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($patchText)) {
-    throw "git show failed to produce patch for $target."
-  }
-
-  # Parse hunks per file.
-  $filePatches = Split-Patch -patch $patchText
-  if (-not $filePatches -or $filePatches.Count -eq 0) {
-    throw "No file patches found in commit $target."
-  }
-
-  # Group split points by file path.
-  $rangesByPath = @{}
-  foreach ($r in $NewCommitRanges) {
-    if ($null -eq $r) { continue }
-    $p = $r.Path
-    if (-not $p) {
-      throw "NewCommitRanges elements must include Path."
-    }
-    if (-not $rangesByPath.ContainsKey($p)) {
-      $rangesByPath[$p] = @()
-    }
-    $rangesByPath[$p] += $r
-  }
-
-  # Helper: extract a single file's diff section from a combined patch.
-  function Get-FileDiffSection {
-    param(
-      [string]$CombinedPatch,
-      [string]$FilePath
-    )
-
-    $parts = $CombinedPatch -split '(?m)^diff --git '
-    if ($parts[0] -eq '') {
-      $parts = $parts[1..($parts.Length - 1)]
-    }
-    foreach ($part in $parts) {
-      if ([string]::IsNullOrWhiteSpace($part)) { continue }
-      $section = "diff --git $part"
-      $escaped = [regex]::Escape($FilePath)
-      if ($section -match "(?m)^diff --git a/$escaped b/$escaped$") {
-        return $section
-      }
-      # fallback: try the original extraction regex used by Split-Patch
-      if ($section -match 'a/(.+?)\s+b/' -and $matches[1] -eq $FilePath) {
-        return $section
-      }
-    }
-    return $null
-  }
-
-  # Compute per-file pieces (hunk fragments) based on split points.
-  $perFilePieces = @{}
-  foreach ($fp in $filePatches) {
-    $path = $fp.FilePath
-    $hunks = @($fp.Patches)
-
-    # Default: no split points => whole file diff is one piece.
-    $splitPoints = @()
-    if ($rangesByPath.ContainsKey($path)) {
-      $splitPoints = @($rangesByPath[$path] | Where-Object { $_.Line } | Sort-Object { [int]$_.Line })
+  if ($OutputScriptPath) {
+    if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Split-Commit execution script')) {
+      return Write-GitScript -Plan $plan -Path $OutputScriptPath
     }
 
-    # For now we only support a single hunk per file for splitting.
-    if ($splitPoints.Count -gt 0 -and $hunks.Count -ne 1) {
-      throw "Split-Commit currently supports splitting only files with exactly 1 hunk. File '$path' has $($hunks.Count)."
-    }
-
-    if ($splitPoints.Count -eq 0) {
-      $perFilePieces[$path] = @($hunks)
-      continue
-    }
-
-    $pieces = @($hunks[0])
-    foreach ($sp in $splitPoints) {
-      if (-not ($sp.PSObject.Properties.Name -contains 'Line') -or $null -eq $sp.Line -or [string]::IsNullOrWhiteSpace([string]$sp.Line)) {
-        throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
-      }
-
-      $line = [int]$sp.Line
-      $col = if ($sp.PSObject.Properties.Name -contains 'Column' -and $sp.Column) { [int]$sp.Column } else { 1 }
-      # Find the current piece that contains the line; for simplicity, split the last piece.
-      $last = $pieces[-1]
-      $split = Split-Hunk -Hunk $last -Line $line -Column $col
-      # Replace the last piece with its two halves.
-      if ($pieces.Count -le 1) {
-        $pieces = @($split)
-      }
-      else {
-        $prefixPieces = $pieces[0..($pieces.Count - 2)]
-        $pieces = @($prefixPieces + $split)
-      }
-    }
-    $perFilePieces[$path] = $pieces
+    return
   }
 
-  # Determine how many commits we will create (max number of pieces across files).
-  $pieceCount = 1
-  foreach ($k in $perFilePieces.Keys) {
-    $c = @($perFilePieces[$k]).Count
-    if ($c -gt $pieceCount) { $pieceCount = $c }
+  $action = "Split commit $($plan.Metadata.TargetCommit) from $($plan.Metadata.CurrentRef)"
+  if ($PSCmdlet.ShouldProcess($plan.Metadata.CurrentRef, $action)) {
+    return Invoke-GitPlan -Plan $plan
   }
-
-  # Rewrite: go to parent, apply each piece-set as its own commit, then replay remaining commits.
-  try {
-    Invoke-Git -ErrorMessage "git reset --hard $parent" reset --hard $parent
-
-    for ($i = 0; $i -lt $pieceCount; $i++) {
-      # Build a combined patch for this piece index.
-      $combined = ""
-      foreach ($fp in $filePatches) {
-        $path = $fp.FilePath
-        $section = Get-FileDiffSection -CombinedPatch $patchText -FilePath $path
-        if (-not $section) {
-          throw "Unable to locate diff section for '$path' in commit patch."
-        }
-
-        $pieces = @($perFilePieces[$path])
-        $h = $null
-        if ($i -lt $pieces.Count) {
-          $h = $pieces[$i]
-        }
-        else {
-          # This file doesn't contribute to this commit piece.
-          continue
-        }
-
-        # If this hunk piece contains no actual changes (only context), omit it.
-        # git apply can reject no-op hunks as corrupt, and we don't want to create empty commits.
-        if ($h -notmatch '(?m)^[+-](?![+-]{2})') {
-          continue
-        }
-
-        # Replace the hunk portion with this piece.
-        $idx = $section.IndexOf("@@")
-        if ($idx -lt 0) {
-          throw "Diff section for '$path' did not contain a hunk header."
-        }
-        $prefix = $section.Substring(0, $idx)
-        # Drop blob hash lines since splitting changes the resulting blob.
-        $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
-        # Do not insert extra blank lines: unified diff hunks cannot contain raw empty lines.
-        # Ensure we end with exactly one newline between sections.
-        # IMPORTANT: Trim only newlines, not whitespace. A blank context line in a unified diff is a single space
-        # character, and TrimEnd() would remove that space and corrupt the patch.
-        $combined += ($prefix + $h.TrimEnd("`r", "`n") + "`n")
-      }
-
-      if ([string]::IsNullOrWhiteSpace($combined)) {
-        continue
-      }
-
-      $tmp = Join-Path $repoRoot (".split-commit.$i.patch")
-      # Avoid Set-Content appending an extra newline, which can introduce a raw blank line at EOF
-      # and make `git apply` reject the patch as corrupt.
-      Set-Content -LiteralPath $tmp -Value $combined -Encoding utf8 -NoNewline
-
-      $keepSplitPatch = ($env:IMMYBUILD_KEEP_SPLIT_PATCH -eq '1') -or ($env:IMMYBUILD_KEEP_TEMPREPO -eq '1')
-
-      # Split patches intentionally contain less context; apply them deterministically.
-      try {
-        Invoke-Git -ErrorMessage "git apply failed for split patch piece $i (file $tmp)" apply --whitespace=nowarn --unidiff-zero $tmp
-      }
-      catch {
-        if (-not $keepSplitPatch) {
-          Invoke-WithProgressSuppressed {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-          }
-        }
-        throw
-      }
-      if (-not $keepSplitPatch) {
-        Invoke-WithProgressSuppressed {
-          Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        }
-      }
-
-      Invoke-Git -ErrorMessage 'git add -A' add -A
-
-      # If the split piece results in no changes (can happen depending on split points), skip creating a commit.
-      git diff --cached --quiet
-      if ($LASTEXITCODE -eq 0) {
-        continue
-      }
-
-      $msg = "$subject (split $($i + 1)/$pieceCount)"
-      Invoke-Git -ErrorMessage "git commit failed while creating split commit piece $i" commit -m $msg
-
-      $newSha = (git rev-parse HEAD)
-      if ($LASTEXITCODE -ne 0 -or -not $newSha) {
-        throw "Unable to resolve SHA for newly created split commit piece $i."
-      }
-      $createdSplitCommits.Add($newSha.Trim()) | Out-Null
-    }
-
-    foreach ($c in $afterTarget) {
-      Invoke-Git -ErrorMessage "git cherry-pick failed for $c" cherry-pick $c
-    }
-  }
-  catch {
-    throw
-  }
-
-  return @($createdSplitCommits)
 }
 
 function Add-Commit {
@@ -1081,6 +2070,165 @@ function Add-Commit {
   }
 }
 
+function New-RemoveCommitPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
+    [string]$CommitRef,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Branch,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePush
+  )
+
+  $repoRoot = Get-GitRepoRoot
+  $currentBranch = Get-GitCurrentBranch
+  $currentHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+
+  if (-not $Branch) {
+    $Branch = $currentBranch
+  }
+
+  if ($Branch -eq 'HEAD') {
+    throw "You are in a detached HEAD state. Checkout a branch before calling Remove-Commit."
+  }
+
+  $commitHash = Resolve-GitCommit -Ref $CommitRef -ErrorMessage "Failed to resolve commit reference '$CommitRef'."
+  $rewritePlan = New-CommitRemovalRewritePlan -CommitHash $commitHash -Branch $Branch -Push:$Push -ForcePush:$ForcePush
+  $usesCurrentBranchReset = ($rewritePlan.Mode -eq 'ResetToParent' -and $currentBranch -eq $Branch)
+
+  $steps = @()
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Remove-Commit execution plan.',
+    'Discovery-time values are frozen below; runtime checks ensure the repository and branch state have not drifted.'
+  )
+
+  $steps += New-GitStep -Kind Literal -Lines @(
+    '$expectedRepoRoot = ' + (ConvertTo-PowerShellStringLiteral $repoRoot)
+    '$expectedCurrentBranch = ' + (ConvertTo-PowerShellStringLiteral $currentBranch)
+    '$expectedCurrentHead = ' + (ConvertTo-PowerShellStringLiteral $currentHead)
+    '$targetBranch = ' + (ConvertTo-PowerShellStringLiteral $Branch)
+    '$expectedBranchHead = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.BranchHead)
+    '$commitHash = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.CommitHash)
+    '$parentHash = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.ParentHash)
+    '$removeMode = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.Mode)
+    '$usesCurrentBranchReset = ' + $(if ($usesCurrentBranchReset) { '$true' } else { '$false' })
+    '$pushBranch = ' + $(if ($rewritePlan.Push) { '$true' } else { '$false' })
+    '$forcePush = ' + $(if ($rewritePlan.ForcePush) { '$true' } else { '$false' })
+  )
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Runtime guards: assert repository, current HEAD, current branch, and target branch head before rewriting history.'
+  )
+
+  $guardLines = @(
+    '$repoRoot = (& git rev-parse --show-toplevel).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {'
+    '  throw "Remove-Commit must be run inside a git repository."'
+    '}'
+    'if ($repoRoot -ne $expectedRepoRoot) {'
+    '  throw "This script was generated for repo root ''$expectedRepoRoot'' but is running in ''$repoRoot''."'
+    '}'
+    '$currentBranch = (& git rev-parse --abbrev-ref HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {'
+    '  throw "Failed to get current branch."'
+    '}'
+    'if ($currentBranch -ne $expectedCurrentBranch) {'
+    '  throw "This script expected current branch ''$expectedCurrentBranch'' but found ''$currentBranch''."'
+    '}'
+    '$currentHead = (& git rev-parse HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or $currentHead -notmatch ''^[0-9a-f]{40}$'') {'
+    '  throw "Failed to resolve HEAD."'
+    '}'
+    'if ($currentHead -ne $expectedCurrentHead) {'
+    '  throw "This script expected HEAD ''$expectedCurrentHead'' but found ''$currentHead''."'
+    '}'
+    '$branchHead = (& git rev-parse $targetBranch).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or $branchHead -notmatch ''^[0-9a-f]{40}$'') {'
+    '  throw "Failed to resolve branch ''$targetBranch''."'
+    '}'
+    'if ($branchHead -ne $expectedBranchHead) {'
+    '  throw "This script expected branch ''$targetBranch'' at ''$expectedBranchHead'' but found ''$branchHead''."'
+    '}'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $guardLines
+
+  $executionLines = @(
+    'if ($removeMode -eq ''ResetToParent'') {'
+    '  if ($usesCurrentBranchReset) {'
+    '    & git reset --hard $parentHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git reset --hard failed while removing $commitHash from $targetBranch"'
+    '    }'
+    '  }'
+    '  else {'
+    '    & git branch -f $targetBranch $parentHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "git branch -f failed while removing $commitHash from $targetBranch"'
+    '    }'
+    '  }'
+    '}'
+    'elseif ($removeMode -eq ''RebaseOntoParent'') {'
+    '  & git rebase --onto $parentHash $commitHash $targetBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) {'
+    '    throw "git rebase --onto failed while removing $commitHash from $targetBranch"'
+    '  }'
+    '}'
+    'else {'
+    '  throw "Unsupported remove mode ''$removeMode''."'
+    '}'
+  )
+
+  if ($rewritePlan.Push) {
+    if ($rewritePlan.ForcePush) {
+      $executionLines += @(
+        'if ($pushBranch) {'
+        '  & git push --force-with-lease origin $targetBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  if ($LASTEXITCODE -ne 0) {'
+        '    throw "git push --force-with-lease origin $targetBranch failed"'
+        '  }'
+        '}'
+      )
+    }
+    else {
+      $executionLines += @(
+        'if ($pushBranch) {'
+        '  & git push origin $targetBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  if ($LASTEXITCODE -ne 0) {'
+        '    throw "git push origin $targetBranch failed"'
+        '  }'
+        '}'
+      )
+    }
+  }
+
+  $executionLines += '$targetBranch'
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Rewrite the target branch using the plan-time-selected strategy, then optionally push the updated ref.'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $executionLines
+
+  return New-GitPlan -Name 'Remove-Commit' -Metadata @{
+    Branch                 = $Branch
+    CommitHash             = $rewritePlan.CommitHash
+    BranchHead             = $rewritePlan.BranchHead
+    ParentHash             = $rewritePlan.ParentHash
+    Mode                   = $rewritePlan.Mode
+    UsesCurrentBranchReset = $usesCurrentBranchReset
+    Push                   = [bool]$rewritePlan.Push
+    ForcePush              = [bool]$rewritePlan.ForcePush
+    OutputScriptCapable    = $true
+  } -Steps $steps
+}
+
 function Remove-Commit {
   <#
   .SYNOPSIS
@@ -1107,9 +2255,14 @@ function Remove-Commit {
   .PARAMETER ForcePush
   If specified and -Push is set, uses --force-with-lease.
 
+  .PARAMETER OutputScriptPath
+  If specified, writes a reviewable PowerShell script that performs the planned removal later
+  instead of executing it immediately.
+
   .OUTPUTS
   System.String
-  The branch name rewritten.
+  The rewritten branch name when executed immediately, or the written script path when
+  -OutputScriptPath is used.
   #>
   [CmdletBinding(SupportsShouldProcess = $true)]
   [OutputType([string])]
@@ -1126,66 +2279,47 @@ function Remove-Commit {
     [switch]$Push,
 
     [Parameter()]
-    [switch]$ForcePush
+    [switch]$ForcePush,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputScriptPath
   )
 
-  if (-not $Branch) {
-    $Branch = (git rev-parse --abbrev-ref HEAD)
-    if ($LASTEXITCODE -ne 0 -or -not $Branch) {
-      throw "Failed to get current branch."
+  $planArgs = @{
+    CommitRef = $CommitRef
+    Push      = $Push
+    ForcePush = $ForcePush
+  }
+  if (-not [string]::IsNullOrWhiteSpace($Branch)) {
+    $planArgs.Branch = $Branch
+  }
+
+  $plan = New-RemoveCommitPlan @planArgs
+
+  if ($OutputScriptPath) {
+    if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Remove-Commit execution script')) {
+      return Write-GitScript -Plan $plan -Path $OutputScriptPath
     }
-    $Branch = $Branch.Trim()
+
+    return
   }
 
-  if ($Branch -eq 'HEAD') {
-    throw "You are in a detached HEAD state. Checkout a branch before calling Remove-Commit."
-  }
-
-  $commitHash = (git rev-parse $CommitRef)
-  if ($LASTEXITCODE -ne 0 -or -not $commitHash) {
-    throw "Failed to resolve commit reference '$CommitRef'."
-  }
-  $commitHash = $commitHash.Trim()
-
-  # Ensure the commit is on the branch we are rewriting.
-  git merge-base --is-ancestor $commitHash $Branch | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Commit $commitHash is not an ancestor of branch '$Branch'."
-  }
-
-  $branchHead = (git rev-parse $Branch).Trim()
-  if ($branchHead -eq $commitHash) {
-    if ($PSCmdlet.ShouldProcess($Branch, "Remove HEAD commit (reset --hard $Branch~1)")) {
-      Invoke-Git -ErrorMessage "git reset --hard $Branch~1" reset --hard "$Branch~1"
-    }
+  $action = if ($plan.Metadata.Mode -eq 'ResetToParent') {
+    "Remove branch tip commit $($plan.Metadata.CommitHash) from $($plan.Metadata.Branch)"
   }
   else {
-    git rev-parse --verify "$commitHash^" 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "Cannot remove the initial commit via rebase."
-    }
-
-    if ($PSCmdlet.ShouldProcess($Branch, "Remove commit via rebase --onto")) {
-      # Rebase the *branch ref* so we don't end up detached.
-      Invoke-Git -ErrorMessage "git rebase --onto failed while removing $commitHash from $Branch" rebase --onto "$commitHash^" $commitHash $Branch
-    }
+    "Remove historical commit $($plan.Metadata.CommitHash) from $($plan.Metadata.Branch)"
   }
 
-  if ($Push) {
-    if ($ForcePush) {
-      Invoke-Git -ErrorMessage "git push --force-with-lease origin $Branch" push --force-with-lease origin $Branch
-    }
-    else {
-      Invoke-Git -ErrorMessage "git push origin $Branch" push origin $Branch
-    }
+  if ($PSCmdlet.ShouldProcess($plan.Metadata.Branch, $action)) {
+    return Invoke-GitPlan -Plan $plan
   }
-
-  return $Branch
 }
 
-function Invoke-GitSplitAbsorb {
+function New-GitSplitAbsorbPlan {
   [CmdletBinding()]
-  [OutputType([string[]])]
+  [OutputType([psobject])]
   param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{40}$')]
@@ -1213,7 +2347,11 @@ function Invoke-GitSplitAbsorb {
     throw "Failed to inspect staged changes before absorb."
   }
   if ($stagedFiles.Count -eq 0) {
-    return @()
+    return [PSCustomObject]@{
+      From        = $From
+      StagedFiles = @()
+      Targets     = @()
+    }
   }
 
   $targetByFile = @{}
@@ -1250,7 +2388,7 @@ function Invoke-GitSplitAbsorb {
     throw "Failed to enumerate commit order for absorb."
   }
 
-  $createdFixups = @()
+  $targets = @()
   foreach ($targetCommit in $orderedTargets) {
     $targetFiles = @(
       $targetByFile.GetEnumerator() |
@@ -1261,6 +2399,34 @@ function Invoke-GitSplitAbsorb {
     if ($targetFiles.Count -eq 0) {
       continue
     }
+
+    $targets += [PSCustomObject]@{
+      CommitHash = $targetCommit
+      Files      = @($targetFiles)
+    }
+  }
+
+  return [PSCustomObject]@{
+    From        = $From
+    StagedFiles = @($stagedFiles)
+    Targets     = @($targets)
+  }
+}
+
+function Invoke-GitSplitAbsorb {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$From
+  )
+
+  $plan = New-GitSplitAbsorbPlan -From $From
+  $createdFixups = @()
+  foreach ($target in @($plan.Targets)) {
+    $targetCommit = $target.CommitHash
+    $targetFiles = @($target.Files)
 
     Invoke-Git -Quiet -ErrorMessage "Failed to create fixup commit for absorb target '$targetCommit'." commit --fixup $targetCommit -- @targetFiles
 
@@ -1274,21 +2440,40 @@ function Invoke-GitSplitAbsorb {
   return $createdFixups
 }
 
-function Set-CommitOrder {
-  <#
-  .SYNOPSIS
-  Reorders commits in the current branch without requiring interactive editing.
-
-  .DESCRIPTION
-  Reorders commits reachable from the current branch by driving `git rebase -i`
-  with a generated sequence editor script.
-
-  When `-Absorb` is specified, staged changes are first converted into `fixup!`
-  commits targeting the most recent commit in the selected range that touched each
-  staged file, and the rebase runs with `--autosquash`.
-  #>
+function New-SetCommitOrderSequenceEditorContent {
   [CmdletBinding()]
-  [OutputType([string[]])]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$TodoScriptPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$From,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$OrderedCommits
+  )
+
+  $escapedTodoScriptPath = $TodoScriptPath.Replace("'", "''")
+  $escapedFrom = $From.Replace("'", "''")
+  $scriptLines = @(
+    'param([string]$TodoPath)',
+    '$ErrorActionPreference = "Stop"',
+    "& '$escapedTodoScriptPath' `$TodoPath -From '$escapedFrom' -OrderedCommits @("
+  ) + @(
+    $OrderedCommits | ForEach-Object { "  '" + $_.Replace("'", "''") + "'" }
+  ) + @(
+    ')'
+  )
+
+  return (($scriptLines -join "`n").TrimEnd()) + "`n"
+}
+
+function New-SetCommitOrderPlan {
+  [CmdletBinding()]
   param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
@@ -1305,126 +2490,280 @@ function Set-CommitOrder {
     [switch]$Absorb
   )
 
+  if ($OrderedCommits.Count -eq 0) {
+    throw "Provide at least one commit hash to reorder."
+  }
+
+  $repoRoot = Get-GitRepoRoot
+  $currentBranch = Get-GitCurrentBranch
+  if ($currentBranch -eq 'HEAD') {
+    throw "Set-CommitOrder must run on a branch (detached HEAD is not supported)."
+  }
+
+  $currentHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+  $status = @(
+    git status --porcelain |
+      ForEach-Object { "$_".TrimEnd() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to determine git status."
+  }
+  if ($status.Count -gt 0 -and -not $Autostash -and -not $Absorb) {
+    throw "Working tree is not clean. Commit/stash changes or re-run with -Autostash."
+  }
+
+  $null = Resolve-GitCommit -Ref $BaseRef -ErrorMessage "Base reference '$BaseRef' is not valid."
+  $from = (Invoke-GitQuery -ErrorMessage "Failed to determine merge-base between HEAD and '$BaseRef'." merge-base HEAD $BaseRef).Output.Trim()
+  if ($from -notmatch '^[0-9a-f]{40}$') {
+    throw "Failed to determine merge-base between HEAD and '$BaseRef'."
+  }
+
+  $resolvedOrderedCommits = @()
+  foreach ($orderedCommit in $OrderedCommits) {
+    if ([string]::IsNullOrWhiteSpace($orderedCommit)) {
+      continue
+    }
+
+    $resolvedCommit = Resolve-GitCommit -Ref $orderedCommit -ErrorMessage "Failed to resolve ordered commit '$orderedCommit'."
+    if (-not (Test-GitCommitIsAncestor -Ancestor $resolvedCommit -Descendant 'HEAD')) {
+      throw "Commit '$orderedCommit' ($resolvedCommit) is not reachable from current branch '$currentBranch'."
+    }
+    if (-not (Test-GitCommitIsAncestor -Ancestor $from -Descendant $resolvedCommit)) {
+      throw "Commit '$orderedCommit' ($resolvedCommit) is outside the reorder range '$from..HEAD'."
+    }
+
+    if ($resolvedCommit -notin $resolvedOrderedCommits) {
+      $resolvedOrderedCommits += $resolvedCommit
+    }
+  }
+
+  if ($resolvedOrderedCommits.Count -eq 0) {
+    throw "No valid commits were provided to reorder."
+  }
+
+  $absorbPlan = if ($Absorb) { New-GitSplitAbsorbPlan -From $from } else { $null }
+  $sequenceEditorScriptPath = New-GitSplitTempFilePath -Prefix 'gitsplit-seq-editor' -Extension '.ps1'
+  $todoScriptPath = Join-Path $PSScriptRoot "New-RebaseTodo.ps1"
+  if (-not (Test-Path -LiteralPath $todoScriptPath)) {
+    throw "Could not find sequence editor helper '$todoScriptPath'."
+  }
+
+  $sequenceEditorScriptContent = New-SetCommitOrderSequenceEditorContent -TodoScriptPath $todoScriptPath -From $from -OrderedCommits $resolvedOrderedCommits
+
+  $steps = @()
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Set-CommitOrder execution plan.',
+    'Discovery-time inputs, helper script contents, and optional absorb targets are frozen below for reviewability.'
+  )
+
+  $variableLines = @(
+    '$expectedRepoRoot = ' + (ConvertTo-PowerShellStringLiteral $repoRoot)
+    '$expectedCurrentBranch = ' + (ConvertTo-PowerShellStringLiteral $currentBranch)
+    '$expectedCurrentHead = ' + (ConvertTo-PowerShellStringLiteral $currentHead)
+    '$from = ' + (ConvertTo-PowerShellStringLiteral $from)
+    '$useAutostash = ' + $(if ($Autostash) { '$true' } else { '$false' })
+    '$useAbsorb = ' + $(if ($Absorb) { '$true' } else { '$false' })
+    '$sequenceEditorScriptPath = ' + (ConvertTo-PowerShellStringLiteral $sequenceEditorScriptPath)
+  )
+  $variableLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix '$sequenceEditorScriptContent = ' -Value $sequenceEditorScriptContent
+
+  if ($absorbPlan -and $absorbPlan.StagedFiles.Count -gt 0) {
+    $variableLines += '$expectedAbsorbFiles = @('
+    $variableLines += @($absorbPlan.StagedFiles | ForEach-Object { '  ' + (ConvertTo-PowerShellStringLiteral $_) })
+    $variableLines += ')'
+  }
+  else {
+    $variableLines += '$expectedAbsorbFiles = @()'
+  }
+
+  $steps += New-GitStep -Kind Literal -Lines $variableLines
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Runtime guards: assert repository, branch, head commit, and (when absorbing) the exact staged file set.'
+  )
+
+  $guardLines = @(
+    '$repoRoot = (& git rev-parse --show-toplevel).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {'
+    '  throw "Set-CommitOrder must be run inside a git repository."'
+    '}'
+    'if ($repoRoot -ne $expectedRepoRoot) {'
+    '  throw "This script was generated for repo root ''$expectedRepoRoot'' but is running in ''$repoRoot''."'
+    '}'
+    '$currentBranch = (& git rev-parse --abbrev-ref HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {'
+    '  throw "Failed to get current branch."'
+    '}'
+    'if ($currentBranch -ne $expectedCurrentBranch) {'
+    '  throw "This script expected branch ''$expectedCurrentBranch'' but found ''$currentBranch''."'
+    '}'
+    '$currentHead = (& git rev-parse HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or $currentHead -notmatch ''^[0-9a-f]{40}$'') {'
+    '  throw "Failed to resolve HEAD."'
+    '}'
+    'if ($currentHead -ne $expectedCurrentHead) {'
+    '  throw "This script expected HEAD ''$expectedCurrentHead'' but found ''$currentHead''."'
+    '}'
+    '$status = @(& git status --porcelain)'
+    'if ($LASTEXITCODE -ne 0) {'
+    '  throw "Failed to determine git status."'
+    '}'
+    '$status = @($status | ForEach-Object { "$_".TrimEnd() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })'
+    'if ($status.Count -gt 0 -and -not $useAutostash -and -not $useAbsorb) {'
+    '  throw "Working tree is not clean. Commit/stash changes or re-run with -Autostash."'
+    '}'
+  )
+
+  if ($Absorb) {
+    $guardLines += @(
+      '$unstagedFiles = @(& git diff --name-only)'
+      'if ($LASTEXITCODE -ne 0) {'
+      '  throw "Failed to inspect unstaged changes before absorb."'
+      '}'
+      '$unstagedFiles = @($unstagedFiles | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })'
+      'if ($unstagedFiles.Count -gt 0) {'
+      '  throw "Invoke-GitSplitAbsorb requires staged-only changes. Stage or stash unstaged changes before using -Absorb."'
+      '}'
+      '$stagedFiles = @(& git diff --cached --name-only)'
+      'if ($LASTEXITCODE -ne 0) {'
+      '  throw "Failed to inspect staged changes before absorb."'
+      '}'
+      '$stagedFiles = @($stagedFiles | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })'
+      'if ((($stagedFiles | Sort-Object) -join "`n") -ne (($expectedAbsorbFiles | Sort-Object) -join "`n")) {'
+      '  throw "Staged files changed since this script was generated."'
+      '}'
+    )
+  }
+
+  $steps += New-GitStep -Kind Literal -Lines $guardLines
+
+  $executionLines = @(
+    '$previousSequenceEditor = $env:GIT_SEQUENCE_EDITOR'
+    'try {'
+    '  Set-Content -Path $sequenceEditorScriptPath -Value $sequenceEditorScriptContent'
+  )
+
+  if ($absorbPlan) {
+    foreach ($target in @($absorbPlan.Targets)) {
+      $targetFiles = @($target.Files | ForEach-Object { ConvertTo-PowerShellStringLiteral $_ }) -join ' '
+      $executionLines += @(
+        '  & git commit --fixup ' + (ConvertTo-PowerShellStringLiteral $target.CommitHash) + ' -- ' + $targetFiles + ' 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  if ($LASTEXITCODE -ne 0) {'
+        '    throw "Failed to create fixup commit for absorb target ' + $target.CommitHash + '."'
+        '  }'
+      )
+    }
+  }
+
+  $executionLines += @(
+    '  $env:GIT_SEQUENCE_EDITOR = "pwsh -NoProfile -File `"$sequenceEditorScriptPath`""'
+    '  $rebaseArgs = @(''rebase'', ''-i'')'
+    '  if ($useAutostash) {'
+    '    $rebaseArgs += ''--autostash'''
+    '  }'
+    '  if ($useAbsorb) {'
+    '    $rebaseArgs += ''--autosquash'''
+    '  }'
+    '  $rebaseArgs += $from'
+    '  & git @rebaseArgs 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) {'
+    '    throw "Set-CommitOrder rebase failed. Resolve conflicts and continue/abort rebase manually."'
+    '  }'
+    '}'
+    'finally {'
+    '  if ($null -ne $previousSequenceEditor) {'
+    '    $env:GIT_SEQUENCE_EDITOR = $previousSequenceEditor'
+    '  }'
+    '  else {'
+    '    Remove-Item Env:GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue'
+    '  }'
+    ''
+    '  if (Test-Path -LiteralPath $sequenceEditorScriptPath) {'
+    '    Remove-Item -Path $sequenceEditorScriptPath -Force -ErrorAction SilentlyContinue'
+    '  }'
+    '}'
+    '@('
+    '  git log --reverse --format=%H "$from..HEAD" |'
+    '    ForEach-Object { $_.Trim() } |'
+    '    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }'
+    ')'
+  )
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Write the generated sequence editor helper, optionally create absorb fixups, then run the deterministic interactive rebase.'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $executionLines
+
+  return New-GitPlan -Name 'Set-CommitOrder' -Metadata @{
+    CurrentBranch         = $currentBranch
+    CurrentHead           = $currentHead
+    From                  = $from
+    OrderedCommits        = @($resolvedOrderedCommits)
+    UseAutostash          = [bool]$Autostash
+    UseAbsorb             = [bool]$Absorb
+    SequenceEditorPath    = $sequenceEditorScriptPath
+    OutputScriptCapable   = $true
+  } -Steps $steps
+}
+
+function Set-CommitOrder {
+  <#
+  .SYNOPSIS
+  Reorders commits in the current branch without requiring interactive editing.
+
+  .DESCRIPTION
+  Reorders commits reachable from the current branch by driving `git rebase -i`
+  with a generated sequence editor script.
+
+  When `-Absorb` is specified, staged changes are first converted into `fixup!`
+  commits targeting the most recent commit in the selected range that touched each
+  staged file, and the rebase runs with `--autosquash`.
+
+  .PARAMETER OutputScriptPath
+  If specified, writes a reviewable PowerShell script for the planned reorder
+  instead of executing it immediately.
+  #>
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$OrderedCommits,
+
+    [Parameter()]
+    [switch]$Autostash,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$BaseRef = "origin/main",
+
+    [Parameter()]
+    [switch]$Absorb,
+
+    [Parameter()]
+    [string]$OutputScriptPath
+  )
+
   try {
-    if ($OrderedCommits.Count -eq 0) {
-      throw "Provide at least one commit hash to reorder."
-    }
+    $plan = New-SetCommitOrderPlan -OrderedCommits $OrderedCommits -Autostash:$Autostash -BaseRef $BaseRef -Absorb:$Absorb
 
-    $currentBranch = (git rev-parse --abbrev-ref HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {
-      throw "Failed to get current branch."
-    }
-    if ($currentBranch -eq 'HEAD') {
-      throw "Set-CommitOrder must run on a branch (detached HEAD is not supported)."
-    }
-
-    $status = git status --porcelain
-    if ($LASTEXITCODE -ne 0) {
-      throw "Failed to determine git status."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($status) -and -not $Autostash -and -not $Absorb) {
-      throw "Working tree is not clean. Commit/stash changes or re-run with -Autostash."
-    }
-
-    git rev-parse --verify "$BaseRef^{commit}" 1>$null 2>$null
-    if ($LASTEXITCODE -ne 0) {
-      throw "Base reference '$BaseRef' is not valid."
-    }
-
-    $from = (git merge-base HEAD $BaseRef).Trim()
-    if ($LASTEXITCODE -ne 0 -or $from -notmatch '^[0-9a-f]{40}$') {
-      throw "Failed to determine merge-base between HEAD and '$BaseRef'."
-    }
-
-    $resolvedOrderedCommits = @()
-    foreach ($orderedCommit in $OrderedCommits) {
-      if ([string]::IsNullOrWhiteSpace($orderedCommit)) {
-        continue
+    if ($OutputScriptPath) {
+      if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Set-CommitOrder execution script')) {
+        return Write-GitScript -Plan $plan -Path $OutputScriptPath
       }
 
-      $resolvedCommitOutput = git rev-parse --verify "$orderedCommit^{commit}" 2>$null
-      $resolvedCommitExitCode = $LASTEXITCODE
-      $resolvedCommit = if ($resolvedCommitExitCode -eq 0 -and $null -ne $resolvedCommitOutput) { "$resolvedCommitOutput".Trim() } else { $null }
-      if ($resolvedCommitExitCode -ne 0 -or $resolvedCommit -notmatch '^[0-9a-f]{40}$') {
-        throw "Failed to resolve ordered commit '$orderedCommit'."
-      }
-
-      git merge-base --is-ancestor $resolvedCommit HEAD | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "Commit '$orderedCommit' ($resolvedCommit) is not reachable from current branch '$currentBranch'."
-      }
-
-      git merge-base --is-ancestor $from $resolvedCommit | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "Commit '$orderedCommit' ($resolvedCommit) is outside the reorder range '$from..HEAD'."
-      }
-
-      if ($resolvedCommit -notin $resolvedOrderedCommits) {
-        $resolvedOrderedCommits += $resolvedCommit
-      }
+      return
     }
 
-    if ($resolvedOrderedCommits.Count -eq 0) {
-      throw "No valid commits were provided to reorder."
+    $action = "Reorder commits from $($plan.Metadata.From)..HEAD on $($plan.Metadata.CurrentBranch)"
+    if ($plan.Metadata.UseAbsorb) {
+      $action += ' with absorb'
     }
 
-    if ($Absorb) {
-      $null = Invoke-GitSplitAbsorb -From $from
+    if ($PSCmdlet.ShouldProcess($plan.Metadata.CurrentBranch, $action)) {
+      return Invoke-GitPlan -Plan $plan
     }
-
-    $sequenceEditorScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gitsplit-seq-editor-" + [Guid]::NewGuid().ToString("N") + ".ps1")
-    $todoScriptPath = Join-Path $PSScriptRoot "New-RebaseTodo.ps1"
-    if (-not (Test-Path -LiteralPath $todoScriptPath)) {
-      throw "Could not find sequence editor helper '$todoScriptPath'."
-    }
-
-    $escapedTodoScriptPath = $todoScriptPath.Replace("'", "''")
-    $escapedFrom = $from.Replace("'", "''")
-    $scriptLines = @(
-      'param([string]$TodoPath)',
-      '$ErrorActionPreference = "Stop"',
-      "& '$escapedTodoScriptPath' `$TodoPath -From '$escapedFrom' -OrderedCommits @(",
-      ($resolvedOrderedCommits | ForEach-Object { "  '" + $_.Replace("'", "''") + "'" }),
-      ')'
-    )
-    Set-Content -Path $sequenceEditorScriptPath -Value $scriptLines
-
-    $previousSequenceEditor = $env:GIT_SEQUENCE_EDITOR
-    try {
-      $env:GIT_SEQUENCE_EDITOR = "pwsh -NoProfile -File `"$sequenceEditorScriptPath`""
-      $rebaseArgs = @('rebase', '-i')
-      if ($Autostash) {
-        $rebaseArgs += '--autostash'
-      }
-      if ($Absorb) {
-        $rebaseArgs += '--autosquash'
-      }
-      $rebaseArgs += $from
-
-      & git @rebaseArgs
-      if ($LASTEXITCODE -ne 0) {
-        throw "Set-CommitOrder rebase failed. Resolve conflicts and continue/abort rebase manually."
-      }
-    }
-    finally {
-      if ($null -ne $previousSequenceEditor) {
-        $env:GIT_SEQUENCE_EDITOR = $previousSequenceEditor
-      }
-      else {
-        Remove-Item Env:GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue
-      }
-
-      if (Test-Path -LiteralPath $sequenceEditorScriptPath) {
-        Remove-Item -Path $sequenceEditorScriptPath -Force -ErrorAction SilentlyContinue
-      }
-    }
-
-    return @(
-      git log --reverse --format=%H "$from..HEAD" |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
   }
   catch {
     Write-Error "Failed to set commit order: $_"
@@ -1468,9 +2807,14 @@ function Move-Commit {
   If specified, stashes uncommitted changes at the start and restores them at the end.
   Without AutoStash, the working tree must be clean.
 
+  .PARAMETER OutputScriptPath
+  If specified, writes a reviewable PowerShell script that performs the planned move later
+  instead of executing it immediately.
+
   .OUTPUTS
   System.String
-  The destination branch name.
+  The destination branch name when executed immediately, or the written script path when
+  -OutputScriptPath is used.
 
   .NOTES
   This command can rewrite history when -RemoveFromSource is specified.
@@ -1497,162 +2841,38 @@ function Move-Commit {
     [switch]$ForcePushSource,
 
     [Parameter()]
-    [switch]$AutoStash
+    [switch]$AutoStash,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputScriptPath
   )
 
-  $repoRoot = (git rev-parse --show-toplevel)
-  if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
-    throw "Move-Commit must be run inside a git repository."
+  $plan = New-MoveCommitPlan `
+    -CommitRef $CommitRef `
+    -DestinationBranch $DestinationBranch `
+    -RemoveFromSource:$RemoveFromSource `
+    -Push:$Push `
+    -ForcePushSource:$ForcePushSource `
+    -AutoStash:$AutoStash
+
+  if ($OutputScriptPath) {
+    if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Move-Commit execution script')) {
+      return Write-GitScript -Plan $plan -Path $OutputScriptPath
+    }
+
+    return
   }
 
-  $stashed = $false
-  $stashName = $null
-  $destWorktreePath = $null
-  $destWorktreeCreated = $false
-  $moveSucceeded = $false
-
-  try {
-    # Ensure worktree safety. A dirty tree can make destructive operations risky.
-    $status = (git status --porcelain)
-    if ($LASTEXITCODE -ne 0) {
-      throw "Failed to determine git status."
-    }
-    if (-not [string]::IsNullOrWhiteSpace($status)) {
-      if (-not $AutoStash) {
-        throw "Uncommitted changes detected. Re-run with -AutoStash, or commit/stash your changes before calling Move-Commit."
-      }
-
-      $stashName = "gitsplit-move-commit-$(Get-Date -Format 'yyyyMMddHHmmss')"
-      Invoke-Git -ErrorMessage 'git stash push failed' stash push -u -m $stashName
-      $stashed = $true
-    }
-
-    $currentBranch = (git rev-parse --abbrev-ref HEAD)
-    if ($LASTEXITCODE -ne 0 -or -not $currentBranch) {
-      throw "Failed to get current branch."
-    }
-    $currentBranch = $currentBranch.Trim()
-    if ($currentBranch -eq 'HEAD') {
-      throw "You are in a detached HEAD state. Checkout a branch before calling Move-Commit."
-    }
-
-    # Resolve commit hash.
-    $commitHash = (git rev-parse $CommitRef)
-    if ($LASTEXITCODE -ne 0 -or -not $commitHash) {
-      throw "Failed to resolve commit reference '$CommitRef'."
-    }
-    $commitHash = $commitHash.Trim()
-
-    # Verify destination branch exists locally or on origin.
-    $branchExists = $true
-    git show-ref --verify --quiet "refs/heads/$DestinationBranch" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      $branchExists = $false
-    }
-    $remoteBranchExists = $true
-    git show-ref --verify --quiet "refs/remotes/origin/$DestinationBranch" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      $remoteBranchExists = $false
-    }
-    if (-not $branchExists -and -not $remoteBranchExists) {
-      throw "Destination branch '$DestinationBranch' does not exist locally or on origin. Create it first."
-    }
-
-    # Create a temporary worktree for destination branch so we don't have to switch.
-    $wtRoot = Join-Path $repoRoot '.gitsplit-worktrees'
-    if (-not (Test-Path -LiteralPath $wtRoot)) {
-      New-Item -Path $wtRoot -ItemType Directory -Force | Out-Null
-    }
-    $destWorktreePath = Join-Path $wtRoot ([guid]::NewGuid().ToString())
-
-    if ($PSCmdlet.ShouldProcess("$DestinationBranch", "Cherry-pick $commitHash")) {
-      if ($remoteBranchExists -and -not $branchExists) {
-        # Create a local branch from origin in the worktree.
-        Invoke-Git -ErrorMessage "git worktree add -b $DestinationBranch" worktree add -b $DestinationBranch $destWorktreePath "origin/$DestinationBranch"
-      }
-      else {
-        Invoke-Git -ErrorMessage "git worktree add $DestinationBranch" worktree add $destWorktreePath $DestinationBranch
-      }
-      $destWorktreeCreated = $true
-
-      # Apply commit to destination.
-      Invoke-Git -ErrorMessage "git -C <worktree> cherry-pick failed for $commitHash" -C $destWorktreePath cherry-pick $commitHash
-
-      if ($Push) {
-        Invoke-Git -ErrorMessage "git -C <worktree> push failed for $DestinationBranch" -C $destWorktreePath push -u origin $DestinationBranch
-      }
-    }
-
-    if ($RemoveFromSource) {
-      $null = Remove-Commit -CommitRef $commitHash -Branch $currentBranch -Push:$Push -ForcePush:$ForcePushSource
-    }
-
-    $moveSucceeded = $true
-    return $DestinationBranch
+  $action = if ($RemoveFromSource) {
+    "Move $($plan.Metadata.CommitHash) to $DestinationBranch and remove it from $($plan.Metadata.SourceBranch)"
   }
-  finally {
-    if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
-      git worktree remove --force $destWorktreePath 2>$null | Out-Null
-    }
-    elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
-      Write-Warning "Preserving destination worktree at '$destWorktreePath' so conflicts can be resolved manually."
-    }
+  else {
+    "Copy $($plan.Metadata.CommitHash) to $DestinationBranch"
+  }
 
-    if ($stashed) {
-      # Try to re-apply the stash created by this function.
-      # IMPORTANT: do NOT pop/apply if we're mid-merge/rebase/cherry-pick.
-      # Also, pop the *specific* stash we created (not simply the top of the stash stack).
-
-      $gitDir = (git rev-parse --git-dir)
-      if ($LASTEXITCODE -eq 0 -and $gitDir) {
-        $gitDir = $gitDir.Trim()
-        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
-          $gitDir = Join-Path $repoRoot $gitDir
-        }
-      }
-
-      $stashLine = $null
-      try {
-        $stashLine = (git stash list --format="%gd %s" | Where-Object { $_ -like "*${stashName}*" } | Select-Object -First 1)
-      }
-      catch {
-        $stashLine = $null
-      }
-
-      if ($stashLine) {
-        $stashRef = ($stashLine -split '\s+', 2)[0]
-
-        $inProgress = $false
-        if ($gitDir -and (Test-Path -LiteralPath $gitDir)) {
-          $inProgress = (
-            (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-apply')) -or
-            (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-merge')) -or
-            (Test-Path -LiteralPath (Join-Path $gitDir 'MERGE_HEAD')) -or
-            (Test-Path -LiteralPath (Join-Path $gitDir 'CHERRY_PICK_HEAD')) -or
-            (Test-Path -LiteralPath (Join-Path $gitDir 'REVERT_HEAD'))
-          )
-        }
-
-        if ($inProgress) {
-          Write-Error @(
-            "Move-Commit created a stash ('$stashName' -> $stashRef) but will NOT restore it because git reports an in-progress operation (merge/rebase/cherry-pick/revert).",
-            '',
-            'How to proceed:',
-            "  1) Inspect state:            git status",
-            "  2) Finish or abort operation: git rebase --continue | git rebase --abort | git merge --abort | git cherry-pick --abort | git revert --abort",
-            "  3) Then restore your changes: git stash pop $stashRef",
-            '',
-            'How to undo the branch rewrite (if you used -RemoveFromSource):',
-            "  - Find the pre-rewrite commit in reflog: git reflog",
-            "  - Reset branch back to it:              git reset --hard <sha>",
-            "  - If you pushed/force-pushed:           git push --force-with-lease"
-          ) -join [Environment]::NewLine
-        }
-        else {
-          git stash pop $stashRef | Out-Null
-        }
-      }
-    }
+  if ($PSCmdlet.ShouldProcess($DestinationBranch, $action)) {
+    return Invoke-GitPlan -Plan $plan
   }
 }
 
@@ -1709,6 +2929,7 @@ else {
   # PowerShell effectively filters exports through BOTH lists, so keep them aligned
   # to avoid surprising "only the intersection" exports.
   Export-ModuleMember -Function @(
+    'Split-Patch'
     'Split-Commit'
     'Add-Commit'
     'Remove-Commit'
