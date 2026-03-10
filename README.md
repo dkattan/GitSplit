@@ -59,6 +59,11 @@ $created = Split-Commit -Ref HEAD -NewCommitRanges @(
   [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
 )
 $created
+
+# Generate a reviewable split script now and execute it later
+Split-Commit -Ref HEAD -NewCommitRanges @(
+  [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+) -OutputScriptPath ./split-commit.ps1
 ```
 
 ### `New-Hunk`
@@ -91,6 +96,9 @@ Remove-Commit -CommitRef 0123abcd -Branch feature/my-branch
 
 # Rewrite and push the branch update (safer force push)
 Remove-Commit -CommitRef HEAD~1 -Push -ForcePush
+
+# Generate a reviewable script now and execute it later
+Remove-Commit -CommitRef HEAD~1 -OutputScriptPath ./remove-commit.ps1
 ```
 
 ### `Move-Commit`
@@ -110,6 +118,9 @@ Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted
 
 # Move HEAD to another branch and remove it from the current branch
 Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -RemoveFromSource
+
+# Generate a reviewable script now and execute it later
+Move-Commit -CommitRef HEAD~1 -DestinationBranch feature/extracted -OutputScriptPath ./move-commit.ps1
 ```
 
 ### `Set-CommitOrder`
@@ -131,7 +142,21 @@ Set-CommitOrder -OrderedCommits @(
 # Stage feedback fixes, absorb them into earlier commits, then reorder
 git add c.txt
 Set-CommitOrder -OrderedCommits @('def5678', 'abc1234') -BaseRef HEAD~2 -Absorb
+
+# Generate a reviewable reorder script now and execute it later
+Set-CommitOrder -OrderedCommits @('def5678', 'abc1234') -BaseRef HEAD~2 -OutputScriptPath ./set-commit-order.ps1
 ```
+
+### Suggested extraction workflow
+
+When you need to peel part of a mixed change onto another branch without losing reviewability:
+
+1. Use `Split-Commit` to break the source commit into smaller commits. If you want a reviewable artifact first, use `-OutputScriptPath` so the generated script carries its split patches inline.
+2. Use `Move-Commit` to apply the extracted commit to the destination branch without switching branches in your current worktree. Again, `-OutputScriptPath` lets you review the exact move plan before running it.
+3. If the source branch still needs cleanup, use `Move-Commit -RemoveFromSource` or `Remove-Commit` to rewrite away the extracted commit from the source side.
+4. Use `Set-CommitOrder` to reorder the resulting commits, and `-Absorb` when you have staged follow-up fixes that should be folded back into earlier commits with `fixup!` commits.
+
+This keeps the entire extraction flow script-capable: split, move/remove, and reorder can all be planned first and executed later from reviewable PowerShell scripts.
 
 ### `Get-CommitMessageFromChanges`
 
