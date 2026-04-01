@@ -50,13 +50,19 @@ $parts = Split-Hunk -Hunk $hunk -Line 5 -Column 12
 
 ### `Split-Commit`
 
-Rewrites history by splitting a commit into multiple commits based on hunk split points.
+Rewrites history by splitting a commit into multiple commits based on hunk split points or whole-file piece assignments.
 
 > Warning: this rewrites history. Use on local branches (or be prepared to force push).
 
 ```powershell
 $created = Split-Commit -Ref HEAD -NewCommitRanges @(
   [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+)
+$created
+
+# Move an entire file diff into the second split piece
+$created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
+  [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
 )
 $created
 

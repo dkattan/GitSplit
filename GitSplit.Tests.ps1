@@ -301,6 +301,132 @@ Import-Module '$escapedManifestPath' -Force
         Pop-Location
       }
     }
+
+    It "can move an entire file into a later split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        $beforeCount = [int](git rev-list --count HEAD)
+
+        $splitPoint = [PSCustomObject]@{ Path = 'b.txt'; PieceNumber = 2 }
+        $created = @(Split-Commit -Ref 'HEAD~1' -NewCommitRanges @($splitPoint))
+
+        $created | Should -HaveCount 2
+
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be ($beforeCount + 1)
+
+        $subjectsText = (git log -n 20 --pretty=format:%s) -join "`n"
+        $subjectsText | Should -Match 'Modify a\.txt and b\.txt \(split 1/2\)'
+        $subjectsText | Should -Match 'Modify a\.txt and b\.txt \(split 2/2\)'
+        $subjectsText | Should -Not -Match '(?m)^Modify a\.txt and b\.txt$'
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited)'
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-4 (new)'
+        @(Get-Content -Path 'b.txt') | Should -Be @(
+          'b-line-1'
+          'b-line-2'
+          'b-line-3'
+        )
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'b.txt') | Should -Contain 'b-line-2 (edited)'
+        @(Get-Content -Path 'b.txt') | Should -Contain 'b-line-4 (new)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "keeps a multi-hunk file together when assigning it to a later split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt baseline' | Out-Null
+
+        @(
+          'a-line-1'
+          'a-line-2 (edited again)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'line-1 changed'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add a.txt multi.txt | Out-Null
+        git commit -m 'Modify a.txt and multi.txt' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'multi.txt'; PieceNumber = 2 }
+        ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited again)'
+        @(Get-Content -Path 'multi.txt') | Should -Be @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        )
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'multi.txt') | Should -Contain 'line-1 changed'
+        @(Get-Content -Path 'multi.txt') | Should -Contain 'line-10 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
   }
 
   Describe "Split-Commit script output" {
@@ -389,6 +515,75 @@ Import-Module '$escapedManifestPath' -Force
         if ($externalTempRoot -and (Test-Path $externalTempRoot)) {
           Remove-Item -Path $externalTempRoot -Recurse -Force
         }
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Commit guardrails" {
+    It "throws when the requested split file has multiple hunks" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt' | Out-Null
+
+        @(
+          'line-1 changed'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Modify multi.txt in two hunks' | Out-Null
+
+        $patch = (@(git show --pretty=format: --no-color HEAD) -join "`n")
+        $filePatches = Split-Patch -patch $patch
+        $multiPatch = $filePatches | Where-Object FilePath -eq 'multi.txt'
+
+        @($multiPatch.Patches) | Should -HaveCount 2
+
+        {
+          Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'multi.txt'; Line = 10 }
+          )
+        } | Should -Throw -ExpectedMessage '*supports splitting only files with exactly 1 hunk*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when a path specifies multiple whole-file piece numbers" {
+      Push-Location $script:TempRepoPath
+      try {
+        {
+          Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 1 }
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+          )
+        } | Should -Throw -ExpectedMessage "*specifies multiple PieceNumber values*"
+      }
+      finally {
         Pop-Location
       }
     }
@@ -1562,6 +1757,74 @@ $destinationBranch
       }
       finally {
         Pop-Location
+      }
+    }
+
+    It "throws and leaves a rebase state when reordered commits conflict on the same file" {
+      Push-Location $script:TempRepoPath
+      try {
+        'shared-base' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Add shared.txt' | Out-Null
+
+        'shared-from-c' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Edit shared.txt to c' | Out-Null
+        $commitC = (git rev-parse HEAD).Trim()
+
+        'shared-from-d' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Edit shared.txt to d' | Out-Null
+        $commitD = (git rev-parse HEAD).Trim()
+
+        $thrown = $null
+        try {
+          Set-CommitOrder -OrderedCommits @($commitD, $commitC) -BaseRef 'HEAD~2'
+        }
+        catch {
+          $thrown = $_
+        }
+
+        $thrown | Should -Not -BeNullOrEmpty
+        $thrown.Exception.Message | Should -Match 'Set-CommitOrder rebase failed'
+        $thrown.Exception.Message | Should -Match 'Conflicted path\(s\): shared\.txt'
+        $thrown.Exception.Message | Should -Match 'Rebase state is still active'
+        $thrown.Exception.Message | Should -Match 'git status'
+        $thrown.Exception.Message | Should -Match 'git rebase --continue'
+        $thrown.Exception.Message | Should -Match 'git rebase --abort'
+
+        $gitDir = (git rev-parse --git-dir).Trim()
+        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+          $gitDir = Join-Path $script:TempRepoPath $gitDir
+        }
+
+        (
+          (Test-Path (Join-Path $gitDir 'rebase-merge')) -or
+          (Test-Path (Join-Path $gitDir 'rebase-apply'))
+        ) | Should -BeTrue
+
+        (@(git status --porcelain) -join "`n") | Should -Match 'UU shared\.txt'
+        (Get-Content -Path 'shared.txt' -Raw) | Should -Match '<<<<<<<'
+      }
+      finally {
+        try {
+          $gitDir = (git rev-parse --git-dir 2>$null).Trim()
+          if (-not [string]::IsNullOrWhiteSpace($gitDir)) {
+            if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+              $gitDir = Join-Path $script:TempRepoPath $gitDir
+            }
+
+            if (
+              (Test-Path (Join-Path $gitDir 'rebase-merge')) -or
+              (Test-Path (Join-Path $gitDir 'rebase-apply'))
+            ) {
+              git rebase --abort 2>$null | Out-Null
+            }
+          }
+        }
+        finally {
+          Pop-Location
+        }
       }
     }
 

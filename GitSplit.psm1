@@ -1607,50 +1607,105 @@ function New-SplitCommitPlan {
   foreach ($filePatch in $filePatches) {
     $path = $filePatch.FilePath
     $hunks = @($filePatch.Patches)
+    $pathRanges = if ($rangesByPath.ContainsKey($path)) { @($rangesByPath[$path]) } else { @() }
     $splitPoints = @()
-    if ($rangesByPath.ContainsKey($path)) {
-      $splitPoints = @($rangesByPath[$path] | Where-Object { $_.Line } | Sort-Object { [int]$_.Line })
+    if ($pathRanges.Count -gt 0) {
+      $splitPoints = @(
+        $pathRanges |
+          Where-Object {
+            ($_.PSObject.Properties.Name -contains 'Line') -and
+            $null -ne $_.Line -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Line)
+          } |
+          Sort-Object { [int]$_.Line }
+      )
+    }
+
+    $pieceNumbers = New-Object System.Collections.Generic.List[int]
+    foreach ($pathRange in $pathRanges) {
+      $piecePropertyName = $null
+      if ($pathRange.PSObject.Properties.Name -contains 'PieceNumber') {
+        $piecePropertyName = 'PieceNumber'
+      }
+      elseif ($pathRange.PSObject.Properties.Name -contains 'Piece') {
+        $piecePropertyName = 'Piece'
+      }
+
+      if (-not $piecePropertyName) {
+        if ($splitPoints -notcontains $pathRange) {
+          throw "Split-Commit: NewCommitRanges elements for path '$path' must include either Line or PieceNumber."
+        }
+        continue
+      }
+
+      $pieceNumberValue = $pathRange.$piecePropertyName
+      if ($null -eq $pieceNumberValue -or [string]::IsNullOrWhiteSpace([string]$pieceNumberValue)) {
+        continue
+      }
+
+      $pieceNumber = [int]$pieceNumberValue
+      if ($pieceNumber -lt 1) {
+        throw "Split-Commit: PieceNumber for path '$path' must be at least 1."
+      }
+
+      $pieceNumbers.Add($pieceNumber) | Out-Null
+    }
+
+    $uniquePieceNumbers = @($pieceNumbers | Select-Object -Unique)
+    if ($uniquePieceNumbers.Count -gt 1) {
+      throw "Split-Commit: Path '$path' specifies multiple PieceNumber values."
     }
 
     if ($splitPoints.Count -gt 0 -and $hunks.Count -ne 1) {
       throw "Split-Commit currently supports splitting only files with exactly 1 hunk. File '$path' has $($hunks.Count)."
     }
 
+    $startPiece = if ($uniquePieceNumbers.Count -gt 0) { [int]$uniquePieceNumbers[0] } else { 1 }
+    $pieceGroups = New-Object System.Collections.Generic.List[object]
+
     if ($splitPoints.Count -eq 0) {
-      $perFilePieces[$path] = @($hunks)
-      continue
+      $pieceGroups.Add([object[]]@($hunks)) | Out-Null
+    }
+    else {
+      $pieces = @($hunks[0])
+      foreach ($splitPoint in $splitPoints) {
+        if (-not ($splitPoint.PSObject.Properties.Name -contains 'Line') -or $null -eq $splitPoint.Line -or [string]::IsNullOrWhiteSpace([string]$splitPoint.Line)) {
+          throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
+        }
+
+        $line = [int]$splitPoint.Line
+        $column = if ($splitPoint.PSObject.Properties.Name -contains 'Column' -and $splitPoint.Column) { [int]$splitPoint.Column } else { 1 }
+        $splitResult = Split-Hunk -Hunk $pieces[-1] -Line $line -Column $column
+        if ($pieces.Count -le 1) {
+          $pieces = @($splitResult)
+        }
+        else {
+          $pieces = @($pieces[0..($pieces.Count - 2)] + $splitResult)
+        }
+      }
+
+      foreach ($piece in $pieces) {
+        $pieceGroups.Add([object[]]@($piece)) | Out-Null
+      }
     }
 
-    $pieces = @($hunks[0])
-    foreach ($splitPoint in $splitPoints) {
-      if (-not ($splitPoint.PSObject.Properties.Name -contains 'Line') -or $null -eq $splitPoint.Line -or [string]::IsNullOrWhiteSpace([string]$splitPoint.Line)) {
-        throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
-      }
-
-      $line = [int]$splitPoint.Line
-      $column = if ($splitPoint.PSObject.Properties.Name -contains 'Column' -and $splitPoint.Column) { [int]$splitPoint.Column } else { 1 }
-      $splitResult = Split-Hunk -Hunk $pieces[-1] -Line $line -Column $column
-      if ($pieces.Count -le 1) {
-        $pieces = @($splitResult)
-      }
-      else {
-        $pieces = @($pieces[0..($pieces.Count - 2)] + $splitResult)
-      }
+    $perFilePieces[$path] = [pscustomobject]@{
+      StartPiece = $startPiece
+      PieceGroups = $pieceGroups.ToArray()
     }
-
-    $perFilePieces[$path] = @($pieces)
   }
 
   $pieceCount = 1
   foreach ($path in $perFilePieces.Keys) {
-    $pathPieceCount = @($perFilePieces[$path]).Count
+    $filePlan = $perFilePieces[$path]
+    $pathPieceCount = $filePlan.StartPiece + @($filePlan.PieceGroups).Count - 1
     if ($pathPieceCount -gt $pieceCount) {
       $pieceCount = $pathPieceCount
     }
   }
 
-  $piecePlans = @()
-  for ($i = 0; $i -lt $pieceCount; $i++) {
+  $rawPiecePatches = New-Object System.Collections.Generic.List[string]
+  for ($i = 1; $i -le $pieceCount; $i++) {
     $combinedPatch = ''
     foreach ($filePatch in $filePatches) {
       $path = $filePatch.FilePath
@@ -1659,13 +1714,14 @@ function New-SplitCommitPlan {
         throw "Unable to locate diff section for '$path' in commit patch."
       }
 
-      $pieces = @($perFilePieces[$path])
-      if ($i -ge $pieces.Count) {
+      $filePlan = $perFilePieces[$path]
+      $localPieceIndex = $i - $filePlan.StartPiece
+      if ($localPieceIndex -lt 0 -or $localPieceIndex -ge @($filePlan.PieceGroups).Count) {
         continue
       }
 
-      $pieceHunk = $pieces[$i]
-      if ($pieceHunk -notmatch '(?m)^[+-](?![+-]{2})') {
+      $pieceHunks = @($filePlan.PieceGroups[$localPieceIndex])
+      if (-not @($pieceHunks | Where-Object { $_ -match '(?m)^[+-](?![+-]{2})' })) {
         continue
       }
 
@@ -1676,19 +1732,31 @@ function New-SplitCommitPlan {
 
       $prefix = $section.Substring(0, $hunkStart)
       $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
-      $combinedPatch += ($prefix + $pieceHunk.TrimEnd("`r", "`n") + "`n")
+      $combinedPatch += $prefix
+      foreach ($pieceHunk in $pieceHunks) {
+        $combinedPatch += ($pieceHunk.TrimEnd("`r", "`n") + "`n")
+      }
     }
 
     if ([string]::IsNullOrWhiteSpace($combinedPatch)) {
       continue
     }
 
+    $rawPiecePatches.Add($combinedPatch) | Out-Null
+  }
+
+  if ($rawPiecePatches.Count -lt 2) {
+    throw "Split-Commit requires at least 2 non-empty split pieces."
+  }
+
+  $piecePlans = @()
+  for ($i = 0; $i -lt $rawPiecePatches.Count; $i++) {
     $piecePlans += [PSCustomObject]@{
       PieceNumber   = $i + 1
-      TotalPieces   = $pieceCount
+      TotalPieces   = $rawPiecePatches.Count
       PatchPath     = New-GitSplitTempFilePath -Prefix ("split-commit-$($i + 1)") -Extension '.patch'
-      PatchContent  = $combinedPatch
-      CommitMessage = "$subject (split $($i + 1)/$pieceCount)"
+      PatchContent  = $rawPiecePatches[$i]
+      CommitMessage = "$subject (split $($i + 1)/$($rawPiecePatches.Count))"
     }
   }
 
@@ -1840,7 +1908,7 @@ function New-SplitCommitPlan {
     OldHead             = $oldHead
     TargetCommit        = $target
     ParentCommit        = $parent
-    PieceCount          = $pieceCount
+    PieceCount          = $piecePlans.Count
     OutputScriptCapable = $true
     PatchArtifactMode   = 'InlineHereString'
   } -Steps $steps
@@ -1849,7 +1917,7 @@ function New-SplitCommitPlan {
 function Split-Commit {
   <#
   .SYNOPSIS
-  Splits a single git commit into multiple commits by splitting hunks.
+  Splits a single git commit into multiple commits by splitting hunks or assigning whole files to split pieces.
 
   .DESCRIPTION
   Rewrites git history by taking the commit identified by `-Ref`, splitting one or more file hunks
@@ -1866,11 +1934,15 @@ function Split-Commit {
 
   .PARAMETER NewCommitRanges
   One or more split point objects. Each object must include:
-    - Path   : file path (as seen in the patch, e.g. 'src/file.txt')
-    - Line   : 1-based NEW-file line number where the next split piece begins
+    - Path        : file path (as seen in the patch, e.g. 'src/file.txt')
+  And either:
+    - Line        : 1-based NEW-file line number where the next split piece begins
+  Or:
+    - PieceNumber : 1-based split piece number that should receive the entire file diff
   Optional:
-    - Column : 1-based column for mid-line splitting (defaults to 1)
-    - Length : currently ignored (reserved for future range splitting)
+    - Column      : 1-based column for mid-line splitting (defaults to 1)
+    - Length      : currently ignored (reserved for future range splitting)
+    - Piece       : alias for PieceNumber
 
   .PARAMETER OutputScriptPath
   If specified, writes a reviewable PowerShell script with inline split patch artifacts
@@ -1887,6 +1959,13 @@ function Split-Commit {
   )
   $created
 
+  .EXAMPLE
+  # Move an entire file diff into the second split commit
+  $created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
+    [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+  )
+  $created
+
   .NOTES
   - This command performs `git reset --hard` and `git cherry-pick`, and will rewrite commits.
   - Run this only on local branches (or be prepared to force push).
@@ -1899,10 +1978,13 @@ function Split-Commit {
     [Parameter(Mandatory = $true)]
     [string]$Ref,
 
-    # One or more split points.
+    # One or more split selectors.
     # Each element must include:
     #  - Path
+    # And either:
     #  - Line (1-based, NEW-file line number)
+    # Or:
+    #  - PieceNumber / Piece (1-based split piece number for the entire file diff)
     # Optional:
     #  - Column (1-based; defaults to 1)
     #  - Length (currently ignored; reserved for future range splitting)
@@ -2694,7 +2776,46 @@ function New-SetCommitOrderPlan {
     '  $rebaseArgs += $from'
     '  & git @rebaseArgs 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
-    '    throw "Set-CommitOrder rebase failed. Resolve conflicts and continue/abort rebase manually."'
+    '    $gitDir = (& git rev-parse --git-dir).Trim()'
+    '    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitDir)) {'
+    '      throw "Set-CommitOrder rebase failed and the git directory could not be resolved for diagnostics."'
+    '    }'
+    '    if (-not [System.IO.Path]::IsPathRooted($gitDir)) {'
+    '      $gitDir = Join-Path $repoRoot $gitDir'
+    '    }'
+    '    $rebaseInProgress = ('
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-merge'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-apply''))'
+    '    )'
+    '    $statusLines = @(& git status --porcelain)'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw "Set-CommitOrder rebase failed and git status could not be inspected for diagnostics."'
+    '    }'
+    '    $statusLines = @($statusLines | ForEach-Object { "$_".TrimEnd() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })'
+    '    $conflictedPaths = @('
+    '      $statusLines |'
+    '        Where-Object { $_ -match ''^(AA|AU|UA|DD|DU|UD|UU)\s+'' } |'
+    '        ForEach-Object { ($_ -replace ''^(AA|AU|UA|DD|DU|UD|UU)\s+'', '''') }'
+    '    )'
+    '    $conflictSummary = if ($conflictedPaths.Count -gt 0) {'
+    '      " Conflicted path(s): " + ($conflictedPaths -join '', '') + "."'
+    '    }'
+    '    else {'
+    '      ""'
+    '    }'
+    '    $rebaseSummary = if ($rebaseInProgress) {'
+    '      " Rebase state is still active."'
+    '    }'
+    '    else {'
+    '      ""'
+    '    }'
+    '    throw ('
+    '      "Set-CommitOrder rebase failed." +'
+    '      $conflictSummary +'
+    '      $rebaseSummary +'
+    '      " Inspect state with ''git status''." +'
+    '      " Finish or abort with ''git rebase --continue'' or ''git rebase --abort''."'
+    '    )'
     '  }'
     '}'
     'finally {'
