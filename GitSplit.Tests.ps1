@@ -394,6 +394,237 @@ Import-Module '$escapedManifestPath' -Force
     }
   }
 
+  Describe "Split-Commit multi-hunk files" {
+    It "can split a later hunk in a multi-hunk file" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Modify multi.txt in two hunks' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'multi.txt'; Line = 10 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        $first = @(Get-Content -Path 'multi.txt')
+        $first[1] | Should -Be 'line-2 changed'
+        $first[9] | Should -Be 'line-10'
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        $final = @(Get-Content -Path 'multi.txt')
+        $final[1] | Should -Be 'line-2 changed'
+        $final[9] | Should -Be 'line-10 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "keeps unsplit multi-hunk files together in the first split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt' | Out-Null
+
+        @(
+          'b-line-1'
+          'b-line-2 (edited again)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (split target)'
+        ) | Set-Content -Path 'b.txt'
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add b.txt multi.txt | Out-Null
+        git commit -m 'Modify b.txt and multi.txt' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; Line = 6 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        $firstMulti = @(Get-Content -Path 'multi.txt')
+        $firstMulti[1] | Should -Be 'line-2 changed'
+        $firstMulti[9] | Should -Be 'line-10 changed'
+
+        $firstB = @(Get-Content -Path 'b.txt')
+        $firstB | Should -Not -Contain 'b-line-6 (split target)'
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        $finalB = @(Get-Content -Path 'b.txt')
+        $finalB | Should -Contain 'b-line-6 (split target)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "keeps trailing hunks with the later split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+          'line-11'
+          'line-12'
+          'line-13'
+          'line-14'
+          'line-15'
+          'line-16'
+          'line-17'
+          'line-18'
+          'line-19'
+          'line-20'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+          'line-11'
+          'line-12'
+          'line-13'
+          'line-14'
+          'line-15'
+          'line-16'
+          'line-17'
+          'line-18 changed'
+          'line-19'
+          'line-20 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Modify multi.txt in three hunks' | Out-Null
+
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'multi.txt'; Line = 18 }
+          ))
+
+        $created | Should -HaveCount 2
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        $first = @(Get-Content -Path 'multi.txt')
+        $first[1] | Should -Be 'line-2 changed'
+        $first[17] | Should -Be 'line-18'
+        $first[19] | Should -Be 'line-20'
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        $final = @(Get-Content -Path 'multi.txt')
+        $final[1] | Should -Be 'line-2 changed'
+        $final[17] | Should -Be 'line-18 changed'
+        $final[19] | Should -Be 'line-20 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
   Describe "New-Range" {
     It "resolves line/column to index and index to line/column consistently" {
       Push-Location $script:TempRepoPath

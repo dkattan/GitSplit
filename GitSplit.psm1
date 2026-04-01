@@ -1724,16 +1724,46 @@ function New-SplitCommitPlan {
       $splitPoints = @($rangesByPath[$path] | Where-Object { $_.Line } | Sort-Object { [int]$_.Line })
     }
 
-    if ($splitPoints.Count -gt 0 -and $hunks.Count -ne 1) {
-      throw "Split-Commit currently supports splitting only files with exactly 1 hunk. File '$path' has $($hunks.Count)."
-    }
-
     if ($splitPoints.Count -eq 0) {
-      $perFilePieces[$path] = @($hunks)
+      $perFilePieces[$path] = @(
+        @{
+          Hunks = @($hunks)
+        }
+      )
       continue
     }
 
-    $pieces = @($hunks[0])
+    $targetHunkIndex = $null
+    for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
+      $header = (($hunks[$hunkIndex] -split "`n", 2)[0]).Trim()
+      if ($header -notmatch '^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@') {
+        throw "Hunk does not start with a valid @@ header: $header"
+      }
+
+      $newStart = [int]$matches[3]
+      $newCount = if ($matches[4]) { [int]$matches[4] } else { 1 }
+      $newEndExclusive = $newStart + $newCount
+
+      $matchingPoints = @($splitPoints | Where-Object {
+          $line = [int]$_.Line
+          $line -ge $newStart -and $line -lt $newEndExclusive
+        })
+
+      if ($matchingPoints.Count -gt 0) {
+        if ($null -ne $targetHunkIndex) {
+          throw "Split-Commit currently supports split points in only one hunk per file. File '$path' has split points in multiple hunks."
+        }
+
+        $targetHunkIndex = $hunkIndex
+      }
+    }
+
+    if ($null -eq $targetHunkIndex) {
+      $requestedLines = @($splitPoints | ForEach-Object { [int]$_.Line }) -join ', '
+      throw "Split-Commit could not match split line(s) $requestedLines to any hunk in file '$path'."
+    }
+
+    $pieces = @($hunks[$targetHunkIndex])
     foreach ($splitPoint in $splitPoints) {
       if (-not ($splitPoint.PSObject.Properties.Name -contains 'Line') -or $null -eq $splitPoint.Line -or [string]::IsNullOrWhiteSpace([string]$splitPoint.Line)) {
         throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
@@ -1750,7 +1780,26 @@ function New-SplitCommitPlan {
       }
     }
 
-    $perFilePieces[$path] = @($pieces)
+    $filePieces = @()
+    for ($pieceIndex = 0; $pieceIndex -lt $pieces.Count; $pieceIndex++) {
+      $pieceHunks = @()
+
+      if ($pieceIndex -eq 0 -and $targetHunkIndex -gt 0) {
+        $pieceHunks += @($hunks[0..($targetHunkIndex - 1)])
+      }
+
+      $pieceHunks += $pieces[$pieceIndex]
+
+      if ($pieceIndex -eq ($pieces.Count - 1) -and $targetHunkIndex -lt ($hunks.Count - 1)) {
+        $pieceHunks += @($hunks[($targetHunkIndex + 1)..($hunks.Count - 1)])
+      }
+
+      $filePieces += @{
+        Hunks = @($pieceHunks)
+      }
+    }
+
+    $perFilePieces[$path] = @($filePieces)
   }
 
   $pieceCount = 1
@@ -1776,8 +1825,9 @@ function New-SplitCommitPlan {
         continue
       }
 
-      $pieceHunk = $pieces[$i]
-      if ($pieceHunk -notmatch '(?m)^[+-](?![+-]{2})') {
+      $piece = $pieces[$i]
+      $pieceHunks = @($piece.Hunks)
+      if ($pieceHunks.Count -eq 0) {
         continue
       }
 
@@ -1788,7 +1838,16 @@ function New-SplitCommitPlan {
 
       $prefix = $section.Substring(0, $hunkStart)
       $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
-      $combinedPatch += ($prefix + $pieceHunk.TrimEnd("`r", "`n") + "`n")
+      $pieceBody = @(
+        $pieceHunks |
+          Where-Object { $_ -match '(?m)^[+-](?![+-]{2})' } |
+          ForEach-Object { $_.TrimEnd("`r", "`n") }
+      )
+      if ($pieceBody.Count -eq 0) {
+        continue
+      }
+
+      $combinedPatch += ($prefix + (($pieceBody -join "`n").TrimEnd("`r", "`n")) + "`n")
     }
 
     if ([string]::IsNullOrWhiteSpace($combinedPatch)) {
