@@ -204,6 +204,24 @@ function Test-GitRefExists {
   throw "Failed to inspect git ref '$Ref'.`n$($query.Output)"
 }
 
+function Get-MoveCommitMissingDestinationBranchMessage {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$DestinationBranch
+  )
+
+  return @(
+    "Destination branch '$DestinationBranch' does not exist locally or on origin."
+    "Create it first with:"
+    "  git branch $DestinationBranch <base-ref>"
+    "Or rerun with:"
+    "  Move-Commit -DestinationBranch $DestinationBranch -CreateDestinationBranch -BaseRef <base-ref>"
+  ) -join [Environment]::NewLine
+}
+
 function Test-GitCommitIsAncestor {
   [CmdletBinding()]
   [OutputType([bool])]
@@ -615,8 +633,22 @@ function New-MoveCommitPlan {
     [switch]$ForcePushSource,
 
     [Parameter()]
-    [switch]$AutoStash
+    [switch]$AutoStash,
+
+    [Parameter()]
+    [switch]$CreateDestinationBranch,
+
+    [Parameter()]
+    [string]$BaseRef
   )
+
+  if ($CreateDestinationBranch -and [string]::IsNullOrWhiteSpace($BaseRef)) {
+    throw "Move-Commit requires -BaseRef when -CreateDestinationBranch is specified."
+  }
+
+  if (-not $CreateDestinationBranch -and -not [string]::IsNullOrWhiteSpace($BaseRef)) {
+    throw "Move-Commit only accepts -BaseRef together with -CreateDestinationBranch."
+  }
 
   $repoRoot = Get-GitRepoRoot
   $currentBranch = Get-GitCurrentBranch
@@ -629,12 +661,37 @@ function New-MoveCommitPlan {
 
   $branchExists = Test-GitRefExists -Ref "refs/heads/$DestinationBranch"
   $remoteBranchExists = Test-GitRefExists -Ref "refs/remotes/origin/$DestinationBranch"
+  $planCreatesDestinationBranch = $false
+  $destinationCreateBaseRef = $null
+  $destinationCreateBaseCommit = $null
+
   if (-not $branchExists -and -not $remoteBranchExists) {
-    throw "Destination branch '$DestinationBranch' does not exist locally or on origin. Create it first."
+    if (-not $CreateDestinationBranch) {
+      throw (Get-MoveCommitMissingDestinationBranchMessage -DestinationBranch $DestinationBranch)
+    }
+
+    $planCreatesDestinationBranch = $true
+    $destinationCreateBaseRef = $BaseRef.Trim()
+    $destinationCreateBaseCommit = Resolve-GitCommit -Ref $destinationCreateBaseRef -ErrorMessage "Base reference '$destinationCreateBaseRef' is not valid."
+  }
+  elseif ($CreateDestinationBranch) {
+    throw @(
+      "Destination branch '$DestinationBranch' already exists locally or on origin."
+      "Remove -CreateDestinationBranch or choose a different branch name."
+    ) -join [Environment]::NewLine
   }
 
-  $destinationRef = if ($branchExists) { "refs/heads/$DestinationBranch" } else { "refs/remotes/origin/$DestinationBranch" }
-  $useRemoteTrackingBranch = $remoteBranchExists -and -not $branchExists
+  $destinationRef = if ($planCreatesDestinationBranch) {
+    "refs/heads/$DestinationBranch"
+  }
+  elseif ($branchExists) {
+    "refs/heads/$DestinationBranch"
+  }
+  else {
+    "refs/remotes/origin/$DestinationBranch"
+  }
+
+  $useRemoteTrackingBranch = $remoteBranchExists -and -not $branchExists -and -not $planCreatesDestinationBranch
   $plannedStashName = New-GitSplitStashName -Operation 'move-commit'
   $plannedDestWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
   $plannedSourceWorktreePath = $null
@@ -669,6 +726,13 @@ function New-MoveCommitPlan {
     '$moveSucceeded = $false'
   )
 
+  if ($planCreatesDestinationBranch) {
+    $steps += New-GitStep -Kind Literal -Lines @(
+      '$destinationCreateBaseRef = ' + (ConvertTo-PowerShellStringLiteral $destinationCreateBaseRef)
+      '$destinationCreateBaseCommit = ' + (ConvertTo-PowerShellStringLiteral $destinationCreateBaseCommit)
+    )
+  }
+
   if ($sourceRemovalPlan) {
     $steps += New-GitStep -Kind Literal -Lines @(
       '$sourceWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedSourceWorktreePath)
@@ -702,13 +766,21 @@ function New-MoveCommitPlan {
     'if ($currentHead -ne $expectedHead) {'
     '  throw "This script expected HEAD ''$expectedHead'' but found ''$currentHead''."'
     '}'
-    '& git show-ref --verify --quiet $destinationRef'
-    'if ($LASTEXITCODE -ne 0) {'
-    '  if ($useRemoteTrackingBranch) {'
-    '    throw "Destination branch ''$destinationBranch'' no longer exists on origin."'
-    '  }'
-    '  throw "Destination branch ''$destinationBranch'' no longer exists locally."'
-    '}'
+  )
+
+  if (-not $planCreatesDestinationBranch) {
+    $guardLines += @(
+      '& git show-ref --verify --quiet $destinationRef'
+      'if ($LASTEXITCODE -ne 0) {'
+      '  if ($useRemoteTrackingBranch) {'
+      '    throw "Destination branch ''$destinationBranch'' no longer exists on origin."'
+      '  }'
+      '  throw "Destination branch ''$destinationBranch'' no longer exists locally."'
+      '}'
+    )
+  }
+
+  $guardLines += @(
     '$status = @(& git status --porcelain)'
     'if ($LASTEXITCODE -ne 0) {'
     '  throw "Failed to determine git status."'
@@ -725,6 +797,27 @@ function New-MoveCommitPlan {
     '  $stashed = $true'
     '}'
   )
+
+  if ($planCreatesDestinationBranch) {
+    $guardLines += @(
+      '& git show-ref --verify --quiet "refs/heads/$destinationBranch"'
+      'if ($LASTEXITCODE -eq 0) {'
+      '  throw "Destination branch ''$destinationBranch'' already exists locally."'
+      '}'
+      '& git show-ref --verify --quiet "refs/remotes/origin/$destinationBranch"'
+      'if ($LASTEXITCODE -eq 0) {'
+      '  throw "Destination branch ''$destinationBranch'' already exists on origin."'
+      '}'
+      '$runtimeBaseRefCommit = (& git rev-parse --verify "$destinationCreateBaseRef^{commit}").Trim()'
+      'if ($LASTEXITCODE -ne 0 -or $runtimeBaseRefCommit -notmatch ''^[0-9a-f]{40}$'') {'
+      '  throw "Base reference ''$destinationCreateBaseRef'' is no longer valid. Re-run Move-Commit with -CreateDestinationBranch -BaseRef <base-ref>."'
+      '}'
+      'if ($runtimeBaseRefCommit -ne $destinationCreateBaseCommit) {'
+      '  throw "Base reference ''$destinationCreateBaseRef'' resolved to ''$runtimeBaseRefCommit'', but this plan expected ''$destinationCreateBaseCommit''. Re-run Move-Commit so the branch is created from the intended base."'
+      '}'
+    )
+  }
+
   $steps += New-GitStep -Kind Literal -Lines $guardLines
 
   $executionLines = @(
@@ -736,18 +829,34 @@ function New-MoveCommitPlan {
     '  throw "Planned destination worktree path ''$destWorktreePath'' already exists."'
     '}'
     'try {'
-    '  if ($useRemoteTrackingBranch) {'
-    '    & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-    '    if ($LASTEXITCODE -ne 0) {'
-    '      throw "git worktree add -b $destinationBranch failed"'
-    '    }'
-    '  }'
-    '  else {'
-    '    & git worktree add $destWorktreePath $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-    '    if ($LASTEXITCODE -ne 0) {'
-    '      throw "git worktree add $destinationBranch failed"'
-    '    }'
-    '  }'
+  )
+
+  if ($planCreatesDestinationBranch) {
+    $executionLines += @(
+      '  & git worktree add -b $destinationBranch $destWorktreePath $destinationCreateBaseCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) {'
+      '    throw "git worktree add -b $destinationBranch $destinationCreateBaseCommit failed"'
+      '  }'
+    )
+  }
+  else {
+    $executionLines += @(
+      '  if ($useRemoteTrackingBranch) {'
+      '    & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    if ($LASTEXITCODE -ne 0) {'
+      '      throw "git worktree add -b $destinationBranch failed"'
+      '    }'
+      '  }'
+      '  else {'
+      '    & git worktree add $destWorktreePath $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    if ($LASTEXITCODE -ne 0) {'
+      '      throw "git worktree add $destinationBranch failed"'
+      '    }'
+      '  }'
+    )
+  }
+
+  $executionLines += @(
     '  $destWorktreeCreated = $true'
     '  & git -C $destWorktreePath cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
@@ -920,6 +1029,9 @@ function New-MoveCommitPlan {
   return New-GitPlan -Name 'Move-Commit' -Metadata @{
     CommitHash          = $commitHash
     DestinationBranch   = $DestinationBranch
+    CreateDestinationBranch = [bool]$planCreatesDestinationBranch
+    DestinationBaseRef  = $destinationCreateBaseRef
+    DestinationBaseCommit = $destinationCreateBaseCommit
     SourceBranch        = $currentBranch
     SourceHead          = $currentHead
     RemoveFromSource    = [bool]$RemoveFromSource
@@ -2817,7 +2929,16 @@ function Move-Commit {
   Commit-ish to move/copy. Defaults to HEAD.
 
   .PARAMETER DestinationBranch
-  The destination branch to receive the commit. Must exist locally or on origin.
+  The destination branch to receive the commit. Must exist locally or on origin
+  unless -CreateDestinationBranch is specified.
+
+  .PARAMETER CreateDestinationBranch
+  If specified, creates the destination branch instead of requiring it to already
+  exist. Requires -BaseRef.
+
+  .PARAMETER BaseRef
+  The base ref to create the destination branch from when -CreateDestinationBranch
+  is specified.
 
   .PARAMETER RemoveFromSource
   If specified, removes the commit from the current branch after applying it to the destination.
@@ -2870,6 +2991,12 @@ function Move-Commit {
     [switch]$AutoStash,
 
     [Parameter()]
+    [switch]$CreateDestinationBranch,
+
+    [Parameter()]
+    [string]$BaseRef,
+
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputScriptPath
   )
@@ -2880,7 +3007,9 @@ function Move-Commit {
     -RemoveFromSource:$RemoveFromSource `
     -Push:$Push `
     -ForcePushSource:$ForcePushSource `
-    -AutoStash:$AutoStash
+    -AutoStash:$AutoStash `
+    -CreateDestinationBranch:$CreateDestinationBranch `
+    -BaseRef $BaseRef
 
   if ($OutputScriptPath) {
     if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Move-Commit execution script')) {

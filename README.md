@@ -111,6 +111,9 @@ This is meant to pair with `Split-Commit`:
 2) Use `Move-Commit` to move one of those commits to a different branch.
 
 > Note: `Move-Commit -RemoveFromSource` rewrites history.
+>
+> By default, `Move-Commit` fails if the destination branch does not already exist.
+> To create it intentionally, use `-CreateDestinationBranch -BaseRef <ref>`.
 
 ```powershell
 # Copy HEAD to another branch (no branch switching in your current worktree)
@@ -118,6 +121,9 @@ Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted
 
 # Move HEAD to another branch and remove it from the current branch
 Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -RemoveFromSource
+
+# Create the destination branch from origin/main, then move HEAD onto it
+Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -CreateDestinationBranch -BaseRef origin/main
 
 # Generate a reviewable script now and execute it later
 Move-Commit -CommitRef HEAD~1 -DestinationBranch feature/extracted -OutputScriptPath ./move-commit.ps1

@@ -641,6 +641,17 @@ Import-Module '$escapedManifestPath' -Force
   }
 
   Describe "Move-Commit" {
+    It "throws an actionable error when the destination branch is missing" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Move-Commit -CommitRef HEAD -DestinationBranch 'missing-dest' } |
+          Should -Throw -ExpectedMessage "*Destination branch 'missing-dest' does not exist locally or on origin.*git branch missing-dest <base-ref>*-CreateDestinationBranch -BaseRef <base-ref>*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
     It "cherry-picks HEAD to another branch without switching the current branch" {
       Push-Location $script:TempRepoPath
       try {
@@ -667,6 +678,34 @@ Import-Module '$escapedManifestPath' -Force
 
         # Destination branch should now contain the commit (SHA changes on cherry-pick, so match by subject)
         $destSubjects = (git log dest -n 50 --pretty=format:%s) -join "`n"
+        $destSubjects | Should -Match ([regex]::Escape($msg))
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "can create the destination branch from an explicit base ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $sourceBranch | Should -Not -Be 'HEAD'
+
+        'created-dest-line' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        $msg = "Created destination move $(New-Guid)"
+        git commit -m $msg | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        $baseCommit = (git rev-parse HEAD~1).Trim()
+
+        $result = Move-Commit -CommitRef HEAD -DestinationBranch 'created-dest' -CreateDestinationBranch -BaseRef 'HEAD~1'
+        $result | Should -Be 'created-dest'
+
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+        (git rev-parse created-dest^).Trim() | Should -Be $baseCommit
+
+        $destSubjects = (git log created-dest -n 50 --pretty=format:%s) -join "`n"
         $destSubjects | Should -Match ([regex]::Escape($msg))
       }
       finally {
@@ -707,6 +746,47 @@ Import-Module '$escapedManifestPath' -Force
         (git log -1 --pretty=format:%s).Trim() | Should -Be $msg
         $destSubjects = (git log scripted-dest -n 50 --pretty=format:%s) -join "`n"
         $destSubjects | Should -Not -Match ([regex]::Escape($msg))
+      }
+      finally {
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+          Remove-Item -Path $scriptPath -Force
+        }
+        Pop-Location
+      }
+    }
+
+    It "can generate and execute a Move-Commit script that creates the destination branch" {
+      $scriptPath = $null
+      Push-Location $script:TempRepoPath
+      try {
+        'script-created-line' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        $msg = "Scripted created destination $(New-Guid)"
+        git commit -m $msg | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        $baseCommit = (git rev-parse HEAD~1).Trim()
+
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("move-commit-create-" + (New-Guid) + ".ps1")
+        if (Test-Path $scriptPath) {
+          Remove-Item -Path $scriptPath -Force
+        }
+
+        Move-Commit -CommitRef HEAD -DestinationBranch 'script-created-dest' -CreateDestinationBranch -BaseRef 'HEAD~1' -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Match ([regex]::Escape("`$destinationCreateBaseRef = 'HEAD~1'"))
+        $scriptText | Should -Match ([regex]::Escape("`$destinationCreateBaseCommit = '$baseCommit'"))
+        $scriptText | Should -Match ([regex]::Escape('& git worktree add -b $destinationBranch $destWorktreePath $destinationCreateBaseCommit'))
+
+        $result = & $scriptPath
+
+        $result | Should -Be 'script-created-dest'
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be 'main'
+        (git rev-parse script-created-dest^).Trim() | Should -Be $baseCommit
+
+        $destSubjects = (git log script-created-dest -n 50 --pretty=format:%s) -join "`n"
+        $destSubjects | Should -Match ([regex]::Escape($msg))
       }
       finally {
         if ($scriptPath -and (Test-Path $scriptPath)) {
@@ -890,6 +970,17 @@ Import-Module '$escapedManifestPath' -Force
         ($status -join "`n") | Should -Match 'UU a.txt'
 
         git worktree remove --force $preserved[0].FullName 2>$null | Out-Null
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "requires -BaseRef when creating the destination branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Move-Commit -CommitRef HEAD -DestinationBranch 'missing-base-ref' -CreateDestinationBranch } |
+          Should -Throw -ExpectedMessage '*requires -BaseRef when -CreateDestinationBranch is specified*'
       }
       finally {
         Pop-Location
