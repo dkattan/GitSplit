@@ -111,6 +111,35 @@ Describe "GitSplit" {
     $global:ProgressPreference = $oldProgressPreference
   }
 
+  Describe "public exports" {
+    It "keeps manifest-based exports aligned with the supported public surface" {
+      $manifestPath = Join-Path $PSScriptRoot 'GitSplit.psd1'
+      $escapedManifestPath = $manifestPath.Replace("'", "''")
+
+      $json = pwsh -NoProfile -Command @"
+Remove-Item Env:CI -ErrorAction SilentlyContinue
+Import-Module '$escapedManifestPath' -Force
+(Get-Command -Module GitSplit | Sort-Object Name | Select-Object -ExpandProperty Name) | ConvertTo-Json -Compress
+"@
+
+      $publicCommands = @($json | ConvertFrom-Json)
+
+      $publicCommands | Should -Be @(
+        'Add-Commit'
+        'Get-CommitMessageFromChanges'
+        'Invoke-GitSplitAbsorb'
+        'Move-Commit'
+        'New-Hunk'
+        'New-Range'
+        'Remove-Commit'
+        'Set-CommitOrder'
+        'Split-Commit'
+        'Split-Hunk'
+        'Split-Patch'
+      )
+    }
+  }
+
   Describe "Split-Patch" {
     It "splits a multi-file git patch into per-file hunks" {
       Push-Location $script:TempRepoPath

@@ -11,11 +11,15 @@
 
   FunctionsToExport = @(
     'Split-Patch'
+    'Split-Hunk'
     'Split-Commit'
+    'New-Hunk'
+    'New-Range'
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
     'Set-CommitOrder'
+    'Invoke-GitSplitAbsorb'
     'Get-CommitMessageFromChanges'
   )
   CmdletsToExport   = @()
@@ -27,8 +31,7 @@
       Tags         = @('git', 'diff', 'patch', 'hunk', 'pester')
       LicenseUri   = 'https://opensource.org/license/mit/'
       ProjectUri   = 'https://github.com/dkattan/GitSplit'
-      ReleaseNotes = 'Initial release.'
+      ReleaseNotes = 'Export patch/hunk helpers and absorb helper for advanced PR splitting workflows.'
     }
   }
 }
-

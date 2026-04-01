@@ -147,6 +147,18 @@ Set-CommitOrder -OrderedCommits @('def5678', 'abc1234') -BaseRef HEAD~2 -Absorb
 Set-CommitOrder -OrderedCommits @('def5678', 'abc1234') -BaseRef HEAD~2 -OutputScriptPath ./set-commit-order.ps1
 ```
 
+### `Invoke-GitSplitAbsorb`
+
+Creates direct `fixup!` commits from staged changes without running the reorder step yet.
+
+This is the primitive behind `Set-CommitOrder -Absorb`, and it is useful when you want to inspect
+or debug absorb targeting before running a full reorder/autosquash flow.
+
+```powershell
+git add c.txt
+Invoke-GitSplitAbsorb -From (git merge-base HEAD origin/main)
+```
+
 ### Suggested extraction workflow
 
 When you need to peel part of a mixed change onto another branch without losing reviewability:

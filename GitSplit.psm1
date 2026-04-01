@@ -2414,6 +2414,32 @@ function New-GitSplitAbsorbPlan {
 }
 
 function Invoke-GitSplitAbsorb {
+  <#
+  .SYNOPSIS
+  Turns staged changes into `fixup!` commits targeted at earlier commits in the current range.
+
+  .DESCRIPTION
+  This is the low-level absorb primitive used by `Set-CommitOrder -Absorb`.
+
+  For each staged file, GitSplit finds the most recent commit after `-From` that touched that
+  file, then creates a `git commit --fixup <target>` commit scoped to that file set.
+
+  This command requires a staged-only working tree:
+  - staged changes are required
+  - unstaged changes are rejected
+
+  .PARAMETER From
+  The exclusive lower bound of the commit range used for target discovery. In practice this is
+  usually the merge-base before your feature branch commits, such as `git merge-base HEAD origin/main`.
+
+  .OUTPUTS
+  System.String[]
+  The SHAs of the created fixup commits, in creation order.
+
+  .EXAMPLE
+  git add src/example.ps1
+  Invoke-GitSplitAbsorb -From (git merge-base HEAD origin/main)
+  #>
   [CmdletBinding()]
   [OutputType([string[]])]
   param(
@@ -2929,12 +2955,16 @@ else {
   # PowerShell effectively filters exports through BOTH lists, so keep them aligned
   # to avoid surprising "only the intersection" exports.
   Export-ModuleMember -Function @(
+    'Split-Hunk'
     'Split-Patch'
     'Split-Commit'
+    'New-Hunk'
+    'New-Range'
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
     'Set-CommitOrder'
+    'Invoke-GitSplitAbsorb'
     'Get-CommitMessageFromChanges'
   )
 }
