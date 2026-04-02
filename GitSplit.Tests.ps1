@@ -301,6 +301,303 @@ Import-Module '$escapedManifestPath' -Force
         Pop-Location
       }
     }
+
+    It "can move an entire file into a later split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        $beforeCount = [int](git rev-list --count HEAD)
+
+        $splitPoint = [PSCustomObject]@{ Path = 'b.txt'; PieceNumber = 2 }
+        $created = @(Split-Commit -Ref 'HEAD~1' -NewCommitRanges @($splitPoint))
+
+        $created | Should -HaveCount 2
+
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be ($beforeCount + 1)
+
+        $subjectsText = (git log -n 20 --pretty=format:%s) -join "`n"
+        $subjectsText | Should -Match 'Modify a\.txt and b\.txt \(split 1/2\)'
+        $subjectsText | Should -Match 'Modify a\.txt and b\.txt \(split 2/2\)'
+        $subjectsText | Should -Not -Match '(?m)^Modify a\.txt and b\.txt$'
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited)'
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-4 (new)'
+        @(Get-Content -Path 'b.txt') | Should -Be @(
+          'b-line-1'
+          'b-line-2'
+          'b-line-3'
+        )
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'b.txt') | Should -Contain 'b-line-2 (edited)'
+        @(Get-Content -Path 'b.txt') | Should -Contain 'b-line-4 (new)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "keeps a multi-hunk file together when assigning it to a later split piece" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt baseline' | Out-Null
+
+        @(
+          'a-line-1'
+          'a-line-2 (edited again)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'line-1 changed'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add a.txt multi.txt | Out-Null
+        git commit -m 'Modify a.txt and multi.txt' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'multi.txt'; PieceNumber = 2 }
+        ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited again)'
+        @(Get-Content -Path 'multi.txt') | Should -Be @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        )
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'multi.txt') | Should -Contain 'line-1 changed'
+        @(Get-Content -Path 'multi.txt') | Should -Contain 'line-10 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "preserves embedded carriage returns in untouched split pieces" {
+      Push-Location $script:TempRepoPath
+      try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        $crPath = Join-Path $script:TempRepoPath 'carriage.txt'
+
+        [System.IO.File]::WriteAllText($crPath, "alpha`ncommon`nomega`n", $utf8NoBom)
+        git add carriage.txt | Out-Null
+        git commit -m 'Add carriage baseline' | Out-Null
+
+        [System.IO.File]::WriteAllText($crPath, "alpha`nmarker`rwith-cr`nomega`n", $utf8NoBom)
+
+        @(
+          'a-line-1'
+          'a-line-2 (edited with carriage test)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        git add a.txt carriage.txt | Out-Null
+        git commit -m 'Modify a.txt and carriage.txt' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'a.txt'; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        [System.IO.File]::ReadAllText($crPath) | Should -Be "alpha`nmarker`rwith-cr`nomega`n"
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited with carriage test)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "bypasses repo pre-commit hooks while creating split commits" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hookPath = Join-Path $script:TempRepoPath '.git/hooks/pre-commit'
+        @(
+          '#!/bin/sh'
+          'echo split-hook-ran >&2'
+          'exit 1'
+        ) | Set-Content -Path $hookPath -NoNewline:$false
+        chmod +x $hookPath
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+        (git log -1 --pretty=format:%s).Trim() | Should -Be 'Modify b.txt (split 2/2)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "preserves binary file sections in untouched split pieces" {
+      Push-Location $script:TempRepoPath
+      try {
+        $binaryPath = Join-Path $script:TempRepoPath 'blob.bin'
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0, 1, 2, 3))
+        git add blob.bin | Out-Null
+        git commit -m 'Add binary baseline' | Out-Null
+
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](4, 5, 6, 7, 8, 9))
+        @(
+          'a-line-1'
+          'a-line-2 (edited with binary test)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        git add a.txt blob.bin | Out-Null
+        git commit -m 'Modify a.txt and blob.bin' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'a.txt'; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        [System.IO.File]::ReadAllBytes($binaryPath) | Should -Be ([byte[]](4, 5, 6, 7, 8, 9))
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited with binary test)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "preserves ignored new files in untouched split pieces" {
+      Push-Location $script:TempRepoPath
+      try {
+        $ignoredRelativePath = 'ignored.generated.json'
+        $ignoredPath = Join-Path $script:TempRepoPath $ignoredRelativePath
+        $ignoredContent = "{""mode"":""preview""}`n"
+
+        $ignoredRelativePath | Set-Content -Path '.gitignore'
+        git add .gitignore | Out-Null
+        git commit -m 'Ignore generated preview file' | Out-Null
+
+        [System.IO.File]::WriteAllText($ignoredPath, $ignoredContent)
+        @(
+          'a-line-1'
+          'a-line-2 (edited with ignored file test)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        git add .gitignore a.txt | Out-Null
+        git add -f $ignoredRelativePath | Out-Null
+        git commit -m 'Modify a.txt and add ignored preview file' | Out-Null
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'a.txt'; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        Test-Path $ignoredRelativePath | Should -BeTrue
+        [System.IO.File]::ReadAllText($ignoredPath) | Should -Be $ignoredContent
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        @(Get-Content -Path 'a.txt') | Should -Contain 'a-line-2 (edited with ignored file test)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
   }
 
   Describe "Split-Commit script output" {
@@ -336,6 +633,8 @@ Import-Module '$escapedManifestPath' -Force
         $scriptText | Should -Match ([regex]::Escape("`$splitPiece1PatchContent = @'"))
         $scriptText | Should -Match ([regex]::Escape('diff --git a/b.txt b/b.txt'))
         $scriptText | Should -Match ([regex]::Escape('b-line-5 (new in commit 3)'))
+        $scriptText | Should -Match ([regex]::Escape('& git apply --index --whitespace=nowarn --unidiff-zero $splitPiece.PatchPath'))
+        $scriptText | Should -Not -Match ([regex]::Escape('git add -A'))
         @(
           Get-ChildItem -Path $externalTempRoot -File -ErrorAction SilentlyContinue
         ) | Should -HaveCount 0
@@ -625,6 +924,22 @@ Import-Module '$escapedManifestPath' -Force
     }
   }
 
+  Describe "Split-Commit guardrails" {
+    It "throws when a path specifies multiple whole-file piece numbers" {
+      Push-Location $script:TempRepoPath
+      try {
+        {
+          Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 1 }
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+          )
+        } | Should -Throw -ExpectedMessage "*specifies multiple PieceNumber values*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
   Describe "New-Range" {
     It "resolves line/column to index and index to line/column consistently" {
       Push-Location $script:TempRepoPath
@@ -972,7 +1287,7 @@ Import-Module '$escapedManifestPath' -Force
         $scriptText | Should -Match ([regex]::Escape('# Generated by GitSplit: Move-Commit'))
         $scriptText | Should -Match ([regex]::Escape("`$commitHash = '$headCommit'"))
         $scriptText | Should -Match ([regex]::Escape('& git worktree add $destWorktreePath $destinationBranch'))
-        $scriptText | Should -Match ([regex]::Escape('& git -C $destWorktreePath cherry-pick $commitHash'))
+        $scriptText | Should -Match ([regex]::Escape('& git -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash'))
 
         (git log -1 --pretty=format:%s).Trim() | Should -Be $msg
         $destSubjects = (git log scripted-dest -n 50 --pretty=format:%s) -join "`n"
@@ -1313,6 +1628,7 @@ Import-Module '$escapedManifestPath' -Force
         $repoRoot = ((git rev-parse --show-toplevel).Trim()).Replace("'", "''")
         $headCommit = (git rev-parse HEAD).Trim()
         $expectedWorktreePath = (Join-Path (Join-Path $script:TempRepoPath '.gitsplit-worktrees') $fixedGuid).Replace("'", "''")
+        $expectedHooksPath = (Join-Path ([System.IO.Path]::GetTempPath()) ("gitsplit-hooks-" + $fixedGuid.Replace('-', ''))).Replace("'", "''")
         $actualScript = ((Get-Content -Path $scriptPath -Raw) -replace "`r`n", "`n").TrimEnd("`n") + "`n"
 
         $expectedScript = @'
@@ -1334,6 +1650,7 @@ $autoStash = $true
 $pushDestination = $false
 $plannedStashName = 'fixed-move-commit-stash'
 $destWorktreePath = '__WORKTREE_PATH__'
+$disabledHooksPath = '__HOOKS_PATH__'
 $stashed = $false
 $stashName = $null
 $destWorktreeCreated = $false
@@ -1396,6 +1713,9 @@ if (Test-Path -LiteralPath $destWorktreePath) {
   throw "Planned destination worktree path '$destWorktreePath' already exists."
 }
 try {
+  if (-not (Test-Path -LiteralPath $disabledHooksPath)) {
+    New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null
+  }
   if ($useRemoteTrackingBranch) {
     & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
     if ($LASTEXITCODE -ne 0) {
@@ -1409,7 +1729,7 @@ try {
     }
   }
   $destWorktreeCreated = $true
-  & git -C $destWorktreePath cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
+  & git -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
   if ($LASTEXITCODE -ne 0) {
     throw "git -C <worktree> cherry-pick failed for $commitHash"
   }
@@ -1430,6 +1750,10 @@ finally {
   }
   elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
     Write-Warning "Preserving destination worktree at '$destWorktreePath' so conflicts can be resolved manually."
+  }
+
+  if (Test-Path -LiteralPath $disabledHooksPath) {
+    Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue
   }
 
   if ($stashed) {
@@ -1490,6 +1814,7 @@ $destinationBranch
         $expectedScript = $expectedScript.Replace('__REPO_ROOT__', $repoRoot)
         $expectedScript = $expectedScript.Replace('__HEAD_COMMIT__', $headCommit)
         $expectedScript = $expectedScript.Replace('__WORKTREE_PATH__', $expectedWorktreePath)
+        $expectedScript = $expectedScript.Replace('__HOOKS_PATH__', $expectedHooksPath)
         $expectedScript = ($expectedScript -replace "`r`n", "`n").TrimEnd("`n") + "`n"
 
         $actualScript | Should -Be $expectedScript
@@ -1768,6 +2093,31 @@ $destinationBranch
         Pop-Location
       }
     }
+
+    It "bypasses repo pre-commit hooks while creating fixup commits" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hookPath = Join-Path $script:TempRepoPath '.git/hooks/pre-commit'
+        @(
+          '#!/bin/sh'
+          'echo absorb-hook-ran >&2'
+          'exit 1'
+        ) | Set-Content -Path $hookPath -NoNewline:$false
+        chmod +x $hookPath
+
+        $from = (git rev-parse HEAD~2).Trim()
+        'absorbed-hook-change' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+
+        $created = @(Invoke-GitSplitAbsorb -From $from)
+
+        $created | Should -HaveCount 1
+        (git log -1 --pretty=format:%s).Trim() | Should -Match '^fixup! Modify b\.txt$'
+      }
+      finally {
+        Pop-Location
+      }
+    }
   }
 
   Describe "Set-CommitOrder" {
@@ -1887,6 +2237,74 @@ $destinationBranch
       }
     }
 
+    It "throws and leaves a rebase state when reordered commits conflict on the same file" {
+      Push-Location $script:TempRepoPath
+      try {
+        'shared-base' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Add shared.txt' | Out-Null
+
+        'shared-from-c' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Edit shared.txt to c' | Out-Null
+        $commitC = (git rev-parse HEAD).Trim()
+
+        'shared-from-d' | Set-Content -Path 'shared.txt'
+        git add shared.txt | Out-Null
+        git commit -m 'Edit shared.txt to d' | Out-Null
+        $commitD = (git rev-parse HEAD).Trim()
+
+        $thrown = $null
+        try {
+          Set-CommitOrder -OrderedCommits @($commitD, $commitC) -BaseRef 'HEAD~2'
+        }
+        catch {
+          $thrown = $_
+        }
+
+        $thrown | Should -Not -BeNullOrEmpty
+        $thrown.Exception.Message | Should -Match 'Set-CommitOrder rebase failed'
+        $thrown.Exception.Message | Should -Match 'Conflicted path\(s\): shared\.txt'
+        $thrown.Exception.Message | Should -Match 'Rebase state is still active'
+        $thrown.Exception.Message | Should -Match 'git status'
+        $thrown.Exception.Message | Should -Match 'git rebase --continue'
+        $thrown.Exception.Message | Should -Match 'git rebase --abort'
+
+        $gitDir = (git rev-parse --git-dir).Trim()
+        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+          $gitDir = Join-Path $script:TempRepoPath $gitDir
+        }
+
+        (
+          (Test-Path (Join-Path $gitDir 'rebase-merge')) -or
+          (Test-Path (Join-Path $gitDir 'rebase-apply'))
+        ) | Should -BeTrue
+
+        (@(git status --porcelain) -join "`n") | Should -Match 'UU shared\.txt'
+        (Get-Content -Path 'shared.txt' -Raw) | Should -Match '<<<<<<<'
+      }
+      finally {
+        try {
+          $gitDir = (git rev-parse --git-dir 2>$null).Trim()
+          if (-not [string]::IsNullOrWhiteSpace($gitDir)) {
+            if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+              $gitDir = Join-Path $script:TempRepoPath $gitDir
+            }
+
+            if (
+              (Test-Path (Join-Path $gitDir 'rebase-merge')) -or
+              (Test-Path (Join-Path $gitDir 'rebase-apply'))
+            ) {
+              git rebase --abort 2>$null | Out-Null
+            }
+          }
+        }
+        finally {
+          Pop-Location
+        }
+      }
+    }
+
     It "executes a generated absorb script later" {
       $scriptPath = $null
       Push-Location $script:TempRepoPath
@@ -1986,6 +2404,37 @@ $destinationBranch
           'Modify b.txt'
           'Add d.txt'
         )
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "bypasses repo pre-commit hooks while creating replayed patch commits" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hookPath = Join-Path $script:TempRepoPath '.git/hooks/pre-commit'
+        @(
+          '#!/bin/sh'
+          'echo add-hook-ran >&2'
+          'exit 1'
+        ) | Set-Content -Path $hookPath -NoNewline:$false
+        chmod +x $hookPath
+
+        $patchPath = Join-Path $script:TempRepoPath 'insert-hook.patch'
+        @(
+          'diff --git a/hook.txt b/hook.txt'
+          'new file mode 100644'
+          '--- /dev/null'
+          '+++ b/hook.txt'
+          '@@ -0,0 +1,1 @@'
+          '+hook-line-1'
+        ) | Set-Content -Path $patchPath
+
+        Add-Commit -After 'HEAD~3' -PatchFile $patchPath -CommitMessage 'Add hook.txt'
+
+        @(Get-Content -Path 'hook.txt') | Should -Be @('hook-line-1')
+        (git log --reverse --format=%s HEAD~4..HEAD) | Should -Contain 'Add hook.txt'
       }
       finally {
         Pop-Location
