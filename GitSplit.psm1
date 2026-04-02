@@ -129,6 +129,48 @@ function Invoke-GitQuery {
   }
 }
 
+function Get-GitPatchText {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ErrorMessage = "git show failed to produce patch for $Ref."
+  )
+
+  $patchPath = New-GitSplitTempFilePath -Prefix 'git-show' -Extension '.patch'
+  try {
+    $showQuery = Invoke-GitQuery -AllowFailure -GitArgs @('show', '--pretty=format:', '--no-color', '--binary', '--output', $patchPath, $Ref)
+    if ($showQuery.ExitCode -ne 0) {
+      if ([string]::IsNullOrWhiteSpace($showQuery.Output)) {
+        throw $ErrorMessage
+      }
+
+      throw "$ErrorMessage`n$($showQuery.Output)"
+    }
+
+    if (-not (Test-Path -LiteralPath $patchPath)) {
+      throw $ErrorMessage
+    }
+
+    $patchText = [System.IO.File]::ReadAllText($patchPath)
+    if ([string]::IsNullOrWhiteSpace($patchText)) {
+      throw $ErrorMessage
+    }
+
+    return $patchText
+  }
+  finally {
+    if (Test-Path -LiteralPath $patchPath) {
+      Remove-Item -LiteralPath $patchPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 function Get-GitRepoRoot {
   [CmdletBinding()]
   [OutputType([string])]
@@ -261,10 +303,12 @@ function ConvertTo-PowerShellHereStringLines {
     [string]$Value = ''
   )
 
-  $normalizedValue = $Value -replace "`r`n", "`n"
   $lines = @("$AssignmentPrefix@'")
-  if (-not [string]::IsNullOrEmpty($normalizedValue)) {
-    $lines += $normalizedValue.TrimEnd("`n") -split "`n"
+  if (-not [string]::IsNullOrEmpty($Value)) {
+    # Preserve trailing empty segments. PowerShell here-strings drop the final newline
+    # immediately before the closing marker, so the source must carry the original text
+    # verbatim and let here-string parsing consume exactly one trailing LF on its own.
+    $lines += $Value.Split(@("`n"), [System.StringSplitOptions]::None)
   }
   $lines += "'@"
   return $lines
@@ -391,6 +435,19 @@ function New-GitSplitTempFilePath {
 
   $guid = (Get-GitSplitGuid).ToString('N')
   return Join-Path (Get-GitSplitTempRoot) ("$Prefix-$guid$Extension")
+}
+
+function New-GitSplitTempDirectoryPath {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Prefix = 'gitsplit-tempdir'
+  )
+
+  $guid = (Get-GitSplitGuid).ToString('N')
+  return Join-Path (Get-GitSplitTempRoot) ("$Prefix-$guid")
 }
 
 function New-GitSplitStashName {
@@ -638,6 +695,7 @@ function New-MoveCommitPlan {
   $plannedStashName = New-GitSplitStashName -Operation 'move-commit'
   $plannedDestWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
   $plannedSourceWorktreePath = $null
+  $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
 
   $sourceRemovalPlan = $null
   if ($RemoveFromSource) {
@@ -663,6 +721,7 @@ function New-MoveCommitPlan {
     '$pushDestination = ' + $(if ($Push) { '$true' } else { '$false' })
     '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
     '$destWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedDestWorktreePath)
+    '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
     '$stashed = $false'
     '$stashName = $null'
     '$destWorktreeCreated = $false'
@@ -736,6 +795,9 @@ function New-MoveCommitPlan {
     '  throw "Planned destination worktree path ''$destWorktreePath'' already exists."'
     '}'
     'try {'
+    '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) {'
+    '    New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null'
+    '  }'
     '  if ($useRemoteTrackingBranch) {'
     '    & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '    if ($LASTEXITCODE -ne 0) {'
@@ -749,7 +811,7 @@ function New-MoveCommitPlan {
     '    }'
     '  }'
     '  $destWorktreeCreated = $true'
-    '  & git -C $destWorktreePath cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  & git -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
     '    throw "git -C <worktree> cherry-pick failed for $commitHash"'
     '  }'
@@ -782,7 +844,7 @@ function New-MoveCommitPlan {
     }
     else {
       $executionLines += @(
-        '  & git -C $sourceWorktreePath rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  & git -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
         '  if ($LASTEXITCODE -ne 0) {'
         '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"'
         '  }'
@@ -854,6 +916,10 @@ function New-MoveCommitPlan {
     '  }'
     '  elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
     '    Write-Warning "Preserving destination worktree at ''$destWorktreePath'' so conflicts can be resolved manually."'
+    '  }'
+    ''
+    '  if (Test-Path -LiteralPath $disabledHooksPath) {'
+    '    Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue'
     '  }'
     ''
     '  if ($stashed) {'
@@ -936,7 +1002,7 @@ function Split-Patch {
 
   .DESCRIPTION
   Parses a text patch that contains one or more `diff --git` sections and returns an array of objects
-  containing a file path and an array of unified diff hunk strings (each starting with an `@@ ... @@` header).
+  containing a file path and any unified diff hunks for that file.
 
   This is used by PR/commit tooling to reason about changes at the hunk level.
 
@@ -947,7 +1013,7 @@ function Split-Patch {
   System.Management.Automation.PSCustomObject
   Objects with properties:
     - FilePath (string): The path extracted from `a/<path> b/<path>`.
-    - Patches  (string[]): The hunks for that file.
+    - Patches  (string[]): The hunks for that file. This can be empty for metadata-only or binary sections.
 
   .EXAMPLE
   $patchText = git show --pretty=format: --no-color HEAD
@@ -980,11 +1046,9 @@ function Split-Patch {
         [System.Text.RegularExpressions.RegexOptions]::Singleline
       ) | ForEach-Object { $_.Value }
 
-      if ($patches.Count -gt 0) {
-        $result += [PSCustomObject]@{
-          FilePath = $filePath
-          Patches  = $patches
-        }
+      $result += [PSCustomObject]@{
+        FilePath = $filePath
+        Patches  = $patches
       }
     }
   }
@@ -1493,29 +1557,28 @@ function Get-GitFileDiffSection {
     [string]$FilePath
   )
 
-  $parts = $CombinedPatch -split '(?m)^diff --git '
-  if ($parts[0] -eq '') {
-    if ($parts.Length -eq 1) {
-      return $null
-    }
-
-    $parts = $parts[1..($parts.Length - 1)]
-  }
-
-  foreach ($part in $parts) {
-    if ([string]::IsNullOrWhiteSpace($part)) {
+  $headerMatches = [regex]::Matches($CombinedPatch, '(?m)^diff --git a/(.+?) b/(.+?)$')
+  for ($i = 0; $i -lt $headerMatches.Count; $i++) {
+    $match = $headerMatches[$i]
+    if (-not $match.Success) {
       continue
     }
 
-    $section = "diff --git $part"
-    $escapedFilePath = [regex]::Escape($FilePath)
-    if ($section -match "(?m)^diff --git a/$escapedFilePath b/$escapedFilePath$") {
-      return $section
+    $oldPath = $match.Groups[1].Value
+    $newPath = $match.Groups[2].Value
+    if ($oldPath -ne $FilePath -and $newPath -ne $FilePath) {
+      continue
     }
 
-    if ($section -match 'a/(.+?)\s+b/' -and $matches[1] -eq $FilePath) {
-      return $section
+    $start = $match.Index
+    $end = if ($i + 1 -lt $headerMatches.Count) {
+      $headerMatches[$i + 1].Index
     }
+    else {
+      $CombinedPatch.Length
+    }
+
+    return $CombinedPatch.Substring($start, $end - $start)
   }
 
   return $null
@@ -1545,6 +1608,7 @@ function New-SplitCommitPlan {
   $oldHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Unable to determine HEAD.'
   $target = Resolve-GitCommit -Ref $Ref -ErrorMessage "Unable to resolve Ref '$Ref'."
   $parent = Resolve-GitCommit -Ref "$target^" -ErrorMessage "Unable to resolve parent for Ref '$Ref' ($target)."
+  $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
 
   $subjectQuery = Invoke-GitQuery -AllowFailure -GitArgs @('log', '-1', '--pretty=format:%s', $target)
   $subject = if ($subjectQuery.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($subjectQuery.Output)) {
@@ -1561,24 +1625,9 @@ function New-SplitCommitPlan {
       Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   )
 
-  $patchLines = @(
-    & git show --pretty=format: --no-color $target 2>&1 |
-      ForEach-Object {
-        if ($null -ne $_) {
-          if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $_.ToString()
-          }
-          else {
-            "$_"
-          }
-        }
-      }
-  )
-  $patchExitCode = $LASTEXITCODE
-  $patchText = $patchLines -join "`n"
-  if ($patchExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($patchText)) {
-    throw "git show failed to produce patch for $target."
-  }
+  # Capture the patch to a file so PowerShell's line-oriented native pipeline cannot split
+  # embedded carriage returns inside added/removed lines.
+  $patchText = Get-GitPatchText -Ref $target -ErrorMessage "git show failed to produce patch for $target."
 
   $filePatches = Split-Patch -patch $patchText
   if (-not $filePatches -or $filePatches.Count -eq 0) {
@@ -1709,18 +1758,31 @@ function New-SplitCommitPlan {
     $combinedPatch = ''
     foreach ($filePatch in $filePatches) {
       $path = $filePatch.FilePath
+      $originalHunks = @($filePatch.Patches)
       $section = Get-GitFileDiffSection -CombinedPatch $patchText -FilePath $path
       if (-not $section) {
         throw "Unable to locate diff section for '$path' in commit patch."
       }
 
       $filePlan = $perFilePieces[$path]
+      $pieceGroups = @($filePlan.PieceGroups)
       $localPieceIndex = $i - $filePlan.StartPiece
-      if ($localPieceIndex -lt 0 -or $localPieceIndex -ge @($filePlan.PieceGroups).Count) {
+      if ($localPieceIndex -lt 0 -or $localPieceIndex -ge $pieceGroups.Count) {
         continue
       }
 
-      $pieceHunks = @($filePlan.PieceGroups[$localPieceIndex])
+      $pieceHunks = @($pieceGroups[$localPieceIndex])
+
+      if ($pieceGroups.Count -eq 1 -and $pieceHunks.Count -eq $originalHunks.Count) {
+        # Preserve whole-file assignments byte-for-byte so git apply sees the exact same
+        # section metadata, binary payload, and line endings as the original diff.
+        $combinedPatch += $section
+        if (-not $section.EndsWith("`n")) {
+          $combinedPatch += "`n"
+        }
+        continue
+      }
+
       if (-not @($pieceHunks | Where-Object { $_ -match '(?m)^[+-](?![+-]{2})' })) {
         continue
       }
@@ -1734,7 +1796,10 @@ function New-SplitCommitPlan {
       $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
       $combinedPatch += $prefix
       foreach ($pieceHunk in $pieceHunks) {
-        $combinedPatch += ($pieceHunk.TrimEnd("`r", "`n") + "`n")
+        $combinedPatch += $pieceHunk
+        if (-not $pieceHunk.EndsWith("`n")) {
+          $combinedPatch += "`n"
+        }
       }
     }
 
@@ -1771,6 +1836,7 @@ function New-SplitCommitPlan {
     '$expectedCurrentRef = ' + (ConvertTo-PowerShellStringLiteral $currentRef)
     '$expectedOldHead = ' + (ConvertTo-PowerShellStringLiteral $oldHead)
     '$parentCommit = ' + (ConvertTo-PowerShellStringLiteral $parent)
+    '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
     '$createdSplitCommits = New-Object System.Collections.Generic.List[string]'
     '$keepSplitPatch = ($env:IMMYBUILD_KEEP_SPLIT_PATCH -eq ''1'') -or ($env:IMMYBUILD_KEEP_TEMPREPO -eq ''1'')'
   )
@@ -1844,6 +1910,9 @@ function New-SplitCommitPlan {
 
   $executionLines = @(
     'try {',
+    '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) {',
+    '    New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null',
+    '  }',
     '  & git reset --hard $parentCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
     '  if ($LASTEXITCODE -ne 0) {',
     '    throw "git reset --hard $parentCommit failed with exit code $LASTEXITCODE"',
@@ -1854,21 +1923,20 @@ function New-SplitCommitPlan {
     '    if (-not [string]::IsNullOrWhiteSpace($patchParent) -and -not (Test-Path -LiteralPath $patchParent)) {',
     '      New-Item -Path $patchParent -ItemType Directory -Force | Out-Null',
     '    }',
-    '    $patchContent = $splitPiece.PatchContent.TrimEnd("`r", "`n") + "`n"',
-    '    Set-Content -LiteralPath $splitPiece.PatchPath -Value $patchContent -Encoding utf8 -NoNewline',
-    '    & git apply --whitespace=nowarn --unidiff-zero $splitPiece.PatchPath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
-    '    if ($LASTEXITCODE -ne 0) {',
-    '      throw "git apply failed for split patch $($splitPiece.PatchPath)."',
+    '    $patchContent = $splitPiece.PatchContent',
+    '    if (-not $patchContent.EndsWith("`n")) {',
+    '      $patchContent += "`n"',
     '    }',
-    '    & git add -A 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    Set-Content -LiteralPath $splitPiece.PatchPath -Value $patchContent -Encoding utf8 -NoNewline',
+    '    & git apply --index --whitespace=nowarn --unidiff-zero $splitPiece.PatchPath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
     '    if ($LASTEXITCODE -ne 0) {',
-    '      throw "git add -A failed"',
+    '      throw "git apply --index failed for split patch $($splitPiece.PatchPath)."',
     '    }',
     '    & git diff --cached --quiet',
     '    if ($LASTEXITCODE -eq 0) {',
     '      continue',
     '    }',
-    '    & git commit -m $splitPiece.CommitMessage 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    & git -c "core.hooksPath=$disabledHooksPath" commit -m $splitPiece.CommitMessage 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
     '    if ($LASTEXITCODE -ne 0) {',
     '      throw "git commit failed while creating split commit ''$($splitPiece.CommitMessage)''."',
     '    }',
@@ -1880,7 +1948,7 @@ function New-SplitCommitPlan {
     '  }',
     '',
     '  foreach ($replayCommit in $replayCommits) {',
-    '    & git cherry-pick $replayCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+    '    & git -c "core.hooksPath=$disabledHooksPath" cherry-pick $replayCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
     '    if ($LASTEXITCODE -ne 0) {',
     '      throw "git cherry-pick failed for $replayCommit"',
     '    }',
@@ -1893,6 +1961,9 @@ function New-SplitCommitPlan {
     '        Remove-Item -LiteralPath $splitPiece.PatchPath -Force -ErrorAction SilentlyContinue',
     '      }',
     '    }',
+    '  }',
+    '  if (Test-Path -LiteralPath $disabledHooksPath) {',
+    '    Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue',
     '  }',
     '}',
     '$createdSplitCommits.ToArray()'
@@ -2083,6 +2154,10 @@ function Add-Commit {
 
     $env:GIT_SEQUENCE_EDITOR = $null
     $env:GIT_EDITOR = ':'
+    $disabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
+    if (-not (Test-Path -LiteralPath $disabledHooksPath)) {
+      New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null
+    }
 
     $commits = @(git rev-list --reverse "$After..HEAD")
     if ($LASTEXITCODE -ne 0) {
@@ -2120,10 +2195,10 @@ function Add-Commit {
     }
 
     if ($olderCommit) {
-      Invoke-Git -ErrorMessage "git cherry-pick (older) failed for $olderCommit" cherry-pick $olderCommit
+      Invoke-Git -ErrorMessage "git cherry-pick (older) failed for $olderCommit" -GitArgs @('-c', "core.hooksPath=$disabledHooksPath", 'cherry-pick', $olderCommit)
     }
 
-    Invoke-Git -ErrorMessage "git cherry-pick (newer) failed for $newerCommit" cherry-pick $newerCommit
+    Invoke-Git -ErrorMessage "git cherry-pick (newer) failed for $newerCommit" -GitArgs @('-c', "core.hooksPath=$disabledHooksPath", 'cherry-pick', $newerCommit)
 
     if (-not (Test-Path $PatchFile)) {
       throw "Patch file not found: $PatchFile"
@@ -2139,13 +2214,16 @@ function Add-Commit {
     }
 
     Invoke-Git -ErrorMessage 'git add -A' add -A
-    Invoke-Git -ErrorMessage "git commit failed for patch $PatchFile (message: $CommitMessage)" commit -m $CommitMessage
+    Invoke-Git -ErrorMessage "git commit failed for patch $PatchFile (message: $CommitMessage)" -GitArgs @('-c', "core.hooksPath=$disabledHooksPath", 'commit', '-m', $CommitMessage)
 
     foreach ($c in $remainingCommits) {
-      Invoke-Git -ErrorMessage "git cherry-pick (remaining) failed for $c" cherry-pick $c
+      Invoke-Git -ErrorMessage "git cherry-pick (remaining) failed for $c" -GitArgs @('-c', "core.hooksPath=$disabledHooksPath", 'cherry-pick', $c)
     }
   }
   finally {
+    if ($disabledHooksPath -and (Test-Path -LiteralPath $disabledHooksPath)) {
+      Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Pop-Location
     $env:GIT_SEQUENCE_EDITOR = $oldSeq
     $env:GIT_EDITOR = $oldEd
@@ -2185,6 +2263,7 @@ function New-RemoveCommitPlan {
   $commitHash = Resolve-GitCommit -Ref $CommitRef -ErrorMessage "Failed to resolve commit reference '$CommitRef'."
   $rewritePlan = New-CommitRemovalRewritePlan -CommitHash $commitHash -Branch $Branch -Push:$Push -ForcePush:$ForcePush
   $usesCurrentBranchReset = ($rewritePlan.Mode -eq 'ResetToParent' -and $currentBranch -eq $Branch)
+  $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
 
   $steps = @()
   $steps += New-GitStep -Kind Comment -Lines @(
@@ -2201,6 +2280,7 @@ function New-RemoveCommitPlan {
     '$commitHash = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.CommitHash)
     '$parentHash = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.ParentHash)
     '$removeMode = ' + (ConvertTo-PowerShellStringLiteral $rewritePlan.Mode)
+    '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
     '$usesCurrentBranchReset = ' + $(if ($usesCurrentBranchReset) { '$true' } else { '$false' })
     '$pushBranch = ' + $(if ($rewritePlan.Push) { '$true' } else { '$false' })
     '$forcePush = ' + $(if ($rewritePlan.ForcePush) { '$true' } else { '$false' })
@@ -2243,6 +2323,9 @@ function New-RemoveCommitPlan {
   $steps += New-GitStep -Kind Literal -Lines $guardLines
 
   $executionLines = @(
+    'if (-not (Test-Path -LiteralPath $disabledHooksPath)) {'
+    '  New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null'
+    '}'
     'if ($removeMode -eq ''ResetToParent'') {'
     '  if ($usesCurrentBranchReset) {'
     '    & git reset --hard $parentHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
@@ -2258,7 +2341,7 @@ function New-RemoveCommitPlan {
     '  }'
     '}'
     'elseif ($removeMode -eq ''RebaseOntoParent'') {'
-    '  & git rebase --onto $parentHash $commitHash $targetBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  & git -c "core.hooksPath=$disabledHooksPath" rebase --onto $parentHash $commitHash $targetBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
     '    throw "git rebase --onto failed while removing $commitHash from $targetBranch"'
     '  }'
@@ -2290,6 +2373,12 @@ function New-RemoveCommitPlan {
       )
     }
   }
+
+  $executionLines += @(
+    'if (Test-Path -LiteralPath $disabledHooksPath) {'
+    '  Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue'
+    '}'
+  )
 
   $executionLines += '$targetBranch'
 
@@ -2532,17 +2621,30 @@ function Invoke-GitSplitAbsorb {
 
   $plan = New-GitSplitAbsorbPlan -From $From
   $createdFixups = @()
-  foreach ($target in @($plan.Targets)) {
-    $targetCommit = $target.CommitHash
-    $targetFiles = @($target.Files)
-
-    Invoke-Git -Quiet -ErrorMessage "Failed to create fixup commit for absorb target '$targetCommit'." commit --fixup $targetCommit -- @targetFiles
-
-    $fixupCommit = (git rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or $fixupCommit -notmatch '^[0-9a-f]{40}$') {
-      throw "Failed to resolve absorb fixup commit for target '$targetCommit'."
+  $disabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
+  try {
+    if (-not (Test-Path -LiteralPath $disabledHooksPath)) {
+      New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null
     }
-    $createdFixups += $fixupCommit
+
+    foreach ($target in @($plan.Targets)) {
+      $targetCommit = $target.CommitHash
+      $targetFiles = @($target.Files)
+
+      $fixupGitArgs = @('-c', "core.hooksPath=$disabledHooksPath", 'commit', '--fixup', $targetCommit, '--') + $targetFiles
+      Invoke-Git -Quiet -ErrorMessage "Failed to create fixup commit for absorb target '$targetCommit'." -GitArgs $fixupGitArgs
+
+      $fixupCommit = (git rev-parse HEAD).Trim()
+      if ($LASTEXITCODE -ne 0 -or $fixupCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Failed to resolve absorb fixup commit for target '$targetCommit'."
+      }
+      $createdFixups += $fixupCommit
+    }
+  }
+  finally {
+    if ($disabledHooksPath -and (Test-Path -LiteralPath $disabledHooksPath)) {
+      Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 
   return $createdFixups
@@ -2652,6 +2754,7 @@ function New-SetCommitOrderPlan {
 
   $absorbPlan = if ($Absorb) { New-GitSplitAbsorbPlan -From $from } else { $null }
   $sequenceEditorScriptPath = New-GitSplitTempFilePath -Prefix 'gitsplit-seq-editor' -Extension '.ps1'
+  $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
   $todoScriptPath = Join-Path $PSScriptRoot "New-RebaseTodo.ps1"
   if (-not (Test-Path -LiteralPath $todoScriptPath)) {
     throw "Could not find sequence editor helper '$todoScriptPath'."
@@ -2672,6 +2775,7 @@ function New-SetCommitOrderPlan {
     '$from = ' + (ConvertTo-PowerShellStringLiteral $from)
     '$useAutostash = ' + $(if ($Autostash) { '$true' } else { '$false' })
     '$useAbsorb = ' + $(if ($Absorb) { '$true' } else { '$false' })
+    '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
     '$sequenceEditorScriptPath = ' + (ConvertTo-PowerShellStringLiteral $sequenceEditorScriptPath)
   )
   $variableLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix '$sequenceEditorScriptContent = ' -Value $sequenceEditorScriptContent
@@ -2749,6 +2853,9 @@ function New-SetCommitOrderPlan {
   $executionLines = @(
     '$previousSequenceEditor = $env:GIT_SEQUENCE_EDITOR'
     'try {'
+    '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) {'
+    '    New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null'
+    '  }'
     '  Set-Content -Path $sequenceEditorScriptPath -Value $sequenceEditorScriptContent'
   )
 
@@ -2756,7 +2863,7 @@ function New-SetCommitOrderPlan {
     foreach ($target in @($absorbPlan.Targets)) {
       $targetFiles = @($target.Files | ForEach-Object { ConvertTo-PowerShellStringLiteral $_ }) -join ' '
       $executionLines += @(
-        '  & git commit --fixup ' + (ConvertTo-PowerShellStringLiteral $target.CommitHash) + ' -- ' + $targetFiles + ' 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  & git -c "core.hooksPath=$disabledHooksPath" commit --fixup ' + (ConvertTo-PowerShellStringLiteral $target.CommitHash) + ' -- ' + $targetFiles + ' 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
         '  if ($LASTEXITCODE -ne 0) {'
         '    throw "Failed to create fixup commit for absorb target ' + $target.CommitHash + '."'
         '  }'
@@ -2774,7 +2881,7 @@ function New-SetCommitOrderPlan {
     '    $rebaseArgs += ''--autosquash'''
     '  }'
     '  $rebaseArgs += $from'
-    '  & git @rebaseArgs 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  & git -c "core.hooksPath=$disabledHooksPath" @rebaseArgs 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
     '    $gitDir = (& git rev-parse --git-dir).Trim()'
     '    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitDir)) {'
@@ -2824,6 +2931,10 @@ function New-SetCommitOrderPlan {
     '  }'
     '  else {'
     '    Remove-Item Env:GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue'
+    '  }'
+    ''
+    '  if (Test-Path -LiteralPath $disabledHooksPath) {'
+    '    Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue'
     '  }'
     ''
     '  if (Test-Path -LiteralPath $sequenceEditorScriptPath) {'
