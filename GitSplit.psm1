@@ -221,6 +221,144 @@ function Resolve-GitCommit {
   return $resolvedCommit
 }
 
+function Test-GitCheckAttrSupportsSource {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  if ($script:GitSplitCheckAttrSupportsSource -is [bool]) {
+    return $script:GitSplitCheckAttrSupportsSource
+  }
+
+  $helpQuery = Invoke-GitQuery -AllowFailure -GitArgs @('check-attr', '-h')
+  $script:GitSplitCheckAttrSupportsSource = $helpQuery.Output -match '(?m)--\[no-\]source <tree-ish>'
+  return $script:GitSplitCheckAttrSupportsSource
+}
+
+function ConvertTo-GitSplitRepoRelativePath {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path,
+
+    [Parameter()]
+    [string]$RepoRoot
+  )
+
+  $normalizedPath = $Path
+  if (-not [string]::IsNullOrWhiteSpace($RepoRoot) -and [System.IO.Path]::IsPathRooted($Path)) {
+    $fullRepoRoot = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+
+    if ($fullPath -eq $fullRepoRoot) {
+      $normalizedPath = ''
+    }
+    elseif ($fullPath.StartsWith($fullRepoRoot + [System.IO.Path]::DirectorySeparatorChar) -or $fullPath.StartsWith($fullRepoRoot + [System.IO.Path]::AltDirectorySeparatorChar)) {
+      $normalizedPath = $fullPath.Substring($fullRepoRoot.Length).TrimStart('\', '/')
+    }
+  }
+
+  $normalizedPath = ($normalizedPath -replace '\\', '/').Trim()
+  while ($normalizedPath.StartsWith('./')) {
+    $normalizedPath = $normalizedPath.Substring(2)
+  }
+
+  return $normalizedPath.TrimStart('/')
+}
+
+function Get-GitSplitFileContentAtCommit {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$Commit,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path
+  )
+
+  $normalizedPath = ConvertTo-GitSplitRepoRelativePath -Path $Path
+  $query = Invoke-GitQuery -AllowFailure -GitArgs @('show', ('{0}:{1}' -f $Commit, $normalizedPath))
+  if ($query.ExitCode -ne 0) {
+    return $null
+  }
+
+  return $query.Output
+}
+
+function Test-GitSplitGeneratedPath {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path,
+
+    [Parameter()]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$Commit
+  )
+
+  $normalizedPath = ConvertTo-GitSplitRepoRelativePath -Path $Path
+  $canInspectAttributes = $true
+  $attrGitArgs = @('check-attr')
+  if (-not [string]::IsNullOrWhiteSpace($Commit)) {
+    if (Test-GitCheckAttrSupportsSource) {
+      $attrGitArgs += @('--source', $Commit)
+    }
+    else {
+      $headCommit = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+      if ($headCommit -ne $Commit) {
+        $canInspectAttributes = $false
+      }
+    }
+  }
+
+  if ($canInspectAttributes) {
+    $attrGitArgs += @('linguist-generated', '--', $normalizedPath)
+    $attrQuery = Invoke-GitQuery -AllowFailure -GitArgs $attrGitArgs
+    if ($attrQuery.ExitCode -eq 0 -and $attrQuery.Output -match ':\s*linguist-generated:\s*(?<Value>\S+)\s*$') {
+      $attributeValue = $matches['Value']
+      if ($attributeValue -eq 'set' -or $attributeValue -eq 'true') {
+        return $true
+      }
+
+      if ($attributeValue -eq 'unset' -or $attributeValue -eq 'false') {
+        return $false
+      }
+    }
+  }
+
+  $generatedPatterns = @(
+    '(^|/)__generated__(/|$)',
+    '\.g\.cs$',
+    '\.g\.i\.cs$',
+    '\.designer\.cs$',
+    '\.generated\.cs$',
+    '\.g\.ts$',
+    '\.g\.tsx$',
+    '\.generated\.ts$',
+    '\.generated\.tsx$',
+    '\.gen\.ts$',
+    '\.gen\.tsx$',
+    '\.g\.js$',
+    '\.generated\.js$',
+    '\.gen\.js$'
+  )
+
+  foreach ($pattern in $generatedPatterns) {
+    if ($normalizedPath -imatch $pattern) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
 function Test-GitRefExists {
   [CmdletBinding()]
   [OutputType([bool])]
@@ -1696,6 +1834,793 @@ function Get-GitFileDiffSection {
   return $null
 }
 
+function Get-GitSplitRelativeImportsFromText {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter()]
+    [AllowNull()]
+    [string]$Text
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return @()
+  }
+
+  $pattern = '(?m)^\s*(?:import|export)\s+(?:[^''"]+?\s+from\s+)?[''"](?<Specifier>\.[^''"]+)[''"]|import\(\s*[''"](?<Specifier>\.[^''"]+)[''"]\s*\)'
+  $matches = [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)
+  return @(
+    $matches |
+      ForEach-Object { $_.Groups['Specifier'].Value } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+      Select-Object -Unique
+  )
+}
+
+function Resolve-GitSplitImportCandidates {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$RepoRoot,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ImporterPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Specifier
+  )
+
+  $normalizedImporterPath = ConvertTo-GitSplitRepoRelativePath -Path $ImporterPath
+  $importerAbsolutePath = Join-Path $RepoRoot ($normalizedImporterPath -replace '/', [string][System.IO.Path]::DirectorySeparatorChar)
+  $importerDirectory = Split-Path -Path $importerAbsolutePath -Parent
+  $baseCandidate = [System.IO.Path]::GetFullPath((Join-Path $importerDirectory $Specifier))
+  $normalizedRepoRoot = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+
+  $candidatePaths = New-Object System.Collections.Generic.List[string]
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+  $candidateAbsolutePaths = @()
+  if ([System.IO.Path]::HasExtension($baseCandidate)) {
+    $candidateAbsolutePaths += $baseCandidate
+  }
+  else {
+    foreach ($extension in @('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.vue')) {
+      $candidateAbsolutePaths += ($baseCandidate + $extension)
+    }
+
+    foreach ($indexFile in @('index.ts', 'index.tsx', 'index.js', 'index.jsx', 'index.mjs', 'index.cjs', 'index.vue')) {
+      $candidateAbsolutePaths += (Join-Path $baseCandidate $indexFile)
+    }
+  }
+
+  foreach ($candidateAbsolutePath in $candidateAbsolutePaths) {
+    $fullCandidatePath = [System.IO.Path]::GetFullPath($candidateAbsolutePath)
+    if ($fullCandidatePath -ne $normalizedRepoRoot -and -not (
+        $fullCandidatePath.StartsWith($normalizedRepoRoot + [System.IO.Path]::DirectorySeparatorChar) -or
+        $fullCandidatePath.StartsWith($normalizedRepoRoot + [System.IO.Path]::AltDirectorySeparatorChar)
+      )) {
+      continue
+    }
+
+    $candidateRelativePath = ConvertTo-GitSplitRepoRelativePath -Path $fullCandidatePath -RepoRoot $RepoRoot
+    if ([string]::IsNullOrWhiteSpace($candidateRelativePath)) {
+      continue
+    }
+
+    if ($seen.Add($candidateRelativePath)) {
+      $candidatePaths.Add($candidateRelativePath) | Out-Null
+    }
+  }
+
+  return $candidatePaths.ToArray()
+}
+
+function Add-GitSplitClosureEntry {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [hashtable]$Entries,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Selected', 'Included', 'Excluded')]
+    [string]$Status,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Rule,
+
+    [Parameter()]
+    [string]$SourcePath,
+
+    [Parameter()]
+    [bool]$IsGenerated = $false
+  )
+
+  $normalizedPath = ConvertTo-GitSplitRepoRelativePath -Path $Path
+  if ($Entries.ContainsKey($normalizedPath)) {
+    return
+  }
+
+  $Entries[$normalizedPath] = [PSCustomObject]@{
+    Path        = $normalizedPath
+    Status      = $Status
+    Rule        = $Rule
+    SourcePath  = $SourcePath
+    IsGenerated = $IsGenerated
+  }
+}
+
+function Get-GitSplitHashHex {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyString()]
+    [string]$Text
+  )
+
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $hashBytes = $sha256.ComputeHash($bytes)
+  }
+  finally {
+    $sha256.Dispose()
+  }
+
+  return -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+}
+
+function Get-GitSplitHunkHeaderMetadata {
+  [CmdletBinding()]
+  [OutputType([psobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Hunk
+  )
+
+  $header = (($Hunk -split "`n", 2)[0]).Trim()
+  if ($header -notmatch '^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@') {
+    throw "Hunk does not start with a valid @@ header: $header"
+  }
+
+  return [PSCustomObject]@{
+    Header   = $header
+    OldStart = [int]$matches[1]
+    OldCount = if ($matches[2]) { [int]$matches[2] } else { 1 }
+    NewStart = [int]$matches[3]
+    NewCount = if ($matches[4]) { [int]$matches[4] } else { 1 }
+  }
+}
+
+function Get-GitSplitHunkDescriptors {
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$Commit,
+
+    [Parameter(Mandatory = $true)]
+    [object[]]$FilePatches
+  )
+
+  $descriptors = New-Object 'System.Collections.Generic.List[object]'
+  $seenHunkIds = New-Object 'System.Collections.Generic.HashSet[string]'
+  $globalHunkNumber = 0
+
+  foreach ($filePatch in @($FilePatches)) {
+    $path = ConvertTo-GitSplitRepoRelativePath -Path $filePatch.FilePath
+    $isGenerated = Test-GitSplitGeneratedPath -Path $path -Commit $Commit
+    $pathHunkNumber = 0
+
+    foreach ($hunk in @($filePatch.Patches)) {
+      $header = (($hunk -split "`n", 2)[0]).Trim()
+      if ($header -notmatch '^@@ ') {
+        continue
+      }
+
+      $metadata = Get-GitSplitHunkHeaderMetadata -Hunk $hunk
+      $pathHunkNumber++
+      $globalHunkNumber++
+
+      $fingerprint = Get-GitSplitHashHex -Text ($Commit + "`n" + $path + "`n" + $hunk.TrimEnd("`r", "`n"))
+      $hunkId = 'h' + $fingerprint.Substring(0, 12)
+      if (-not $seenHunkIds.Add($hunkId)) {
+        throw "Encountered duplicate hunk identifier '$hunkId' while enumerating commit $Commit."
+      }
+
+      $preview = @(
+        ($hunk -split "\r?\n") |
+          Select-Object -Skip 1 |
+          Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+          Select-Object -First 3 |
+          ForEach-Object { $_.Trim() }
+      ) -join ' / '
+
+      $descriptors.Add([PSCustomObject]@{
+          HunkId         = $hunkId
+          Fingerprint    = $fingerprint
+          Commit         = $Commit
+          Path           = $path
+          HunkNumber     = $globalHunkNumber
+          PathHunkNumber = $pathHunkNumber
+          OldStart       = $metadata.OldStart
+          OldCount       = $metadata.OldCount
+          NewStart       = $metadata.NewStart
+          NewCount       = $metadata.NewCount
+          Header         = $metadata.Header
+          Preview        = $preview
+          IsGenerated    = $isGenerated
+          Hunk           = $hunk
+        }) | Out-Null
+    }
+  }
+
+  return $descriptors.ToArray()
+}
+
+function Get-GitSplitChangedCommitInfo {
+  [CmdletBinding()]
+  [OutputType([psobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref
+  )
+
+  $targetCommit = Resolve-GitCommit -Ref $Ref -ErrorMessage "Unable to resolve Ref '$Ref'."
+  $patchText = Get-GitPatchText -Ref $targetCommit -ErrorMessage "git show failed to produce patch for $targetCommit."
+  $filePatches = @(Split-Patch -patch $patchText)
+  if (-not $filePatches -or $filePatches.Count -eq 0) {
+    throw "No file patches found in commit $targetCommit."
+  }
+
+  return [PSCustomObject]@{
+    Commit      = $targetCommit
+    PatchText   = $patchText
+    FilePatches = $filePatches
+  }
+}
+
+function Get-GitSplitHunks {
+  <#
+  .SYNOPSIS
+  Enumerates changed hunks in a commit and assigns stable identifiers to them.
+
+  .DESCRIPTION
+  Returns changed hunks for the specified commit with deterministic `HunkId` values derived from
+  the commit, path, and hunk content. These identifiers are intended for CLI-friendly selection
+  and can be passed back into `Split-Commit` via `NewCommitRanges` entries that include `HunkId`
+  and `PieceNumber`.
+  #>
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref
+  )
+
+  $commitInfo = Get-GitSplitChangedCommitInfo -Ref $Ref
+  return @(
+    Get-GitSplitHunkDescriptors -Commit $commitInfo.Commit -FilePatches $commitInfo.FilePatches |
+      Select-Object HunkId, Fingerprint, Commit, Path, HunkNumber, PathHunkNumber, OldStart, OldCount, NewStart, NewCount, Header, Preview, IsGenerated
+  )
+}
+
+function Get-GitSplitWorkflowLocalActionPathsFromText {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter()]
+    [AllowNull()]
+    [string]$Text
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return @()
+  }
+
+  $pattern = '(?m)^\s*(?:-\s*)?uses:\s*[''"]?(?<Path>\./[^''"\s#]+)[''"]?'
+  $matches = [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern)
+  $results = New-Object System.Collections.Generic.List[string]
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+  foreach ($match in $matches) {
+    $rawPath = $match.Groups['Path'].Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($rawPath) -or -not $rawPath.StartsWith('./')) {
+      continue
+    }
+
+    $repoRelativePath = ConvertTo-GitSplitRepoRelativePath -Path $rawPath.Substring(2)
+    if ([string]::IsNullOrWhiteSpace($repoRelativePath)) {
+      continue
+    }
+
+    $candidatePaths = @()
+    if ([System.IO.Path]::HasExtension($repoRelativePath)) {
+      $candidatePaths += $repoRelativePath
+    }
+    else {
+      $repoRelativePath = $repoRelativePath.TrimEnd('/')
+      $candidatePaths += "$repoRelativePath/action.yml"
+      $candidatePaths += "$repoRelativePath/action.yaml"
+    }
+
+    foreach ($candidatePath in $candidatePaths) {
+      $normalizedCandidatePath = ConvertTo-GitSplitRepoRelativePath -Path $candidatePath
+      if ($seen.Add($normalizedCandidatePath)) {
+        $results.Add($normalizedCandidatePath) | Out-Null
+      }
+    }
+  }
+
+  return $results.ToArray()
+}
+
+function Add-GitSplitDependencyEdge {
+  [CmdletBinding()]
+  param(
+    [Parameter()]
+    [System.Collections.Generic.List[object]]$Edges,
+
+    [Parameter()]
+    [System.Collections.Generic.HashSet[string]]$SeenKeys,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SourcePath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$TargetPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Rule,
+
+    [Parameter()]
+    [bool]$IsGeneratedTarget = $false
+  )
+
+  $normalizedSourcePath = ConvertTo-GitSplitRepoRelativePath -Path $SourcePath
+  $normalizedTargetPath = ConvertTo-GitSplitRepoRelativePath -Path $TargetPath
+  if ($normalizedSourcePath -eq $normalizedTargetPath) {
+    return
+  }
+
+  $key = '{0}|{1}|{2}|{3}' -f $normalizedSourcePath, $normalizedTargetPath, $Rule, $IsGeneratedTarget
+  if (-not $SeenKeys.Add($key)) {
+    return
+  }
+
+  $Edges.Add([PSCustomObject]@{
+      SourcePath        = $normalizedSourcePath
+      TargetPath        = $normalizedTargetPath
+      Rule              = $Rule
+      IsGeneratedTarget = $IsGeneratedTarget
+    }) | Out-Null
+}
+
+function Get-GitSplitDependencyEdges {
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$RepoRoot,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$Commit,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNull()]
+    [string[]]$ChangedPaths
+  )
+
+  $changedPathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($changedPath in $ChangedPaths) {
+    [void]$changedPathSet.Add((ConvertTo-GitSplitRepoRelativePath -Path $changedPath))
+  }
+
+  $edges = New-Object 'System.Collections.Generic.List[object]'
+  $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+
+  $lockPaths = @(
+    $ChangedPaths |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_ } |
+      Where-Object { $_ -in @('bun.lock', 'bun.lockb') }
+  )
+  $packagePaths = @(
+    $ChangedPaths |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_ } |
+      Where-Object { [System.IO.Path]::GetFileName($_) -eq 'package.json' }
+  )
+  foreach ($packagePath in $packagePaths) {
+    foreach ($lockPath in $lockPaths) {
+      Add-GitSplitDependencyEdge -Edges $edges -SeenKeys $seenKeys -SourcePath $packagePath -TargetPath $lockPath -Rule BunLock
+      Add-GitSplitDependencyEdge -Edges $edges -SeenKeys $seenKeys -SourcePath $lockPath -TargetPath $packagePath -Rule BunLock
+    }
+  }
+
+  $workflowPaths = @(
+    $ChangedPaths |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_ } |
+      Where-Object { $_ -like '.github/workflows/*.yml' -or $_ -like '.github/workflows/*.yaml' }
+  )
+  foreach ($workflowPath in $workflowPaths) {
+    $workflowText = Get-GitSplitFileContentAtCommit -Commit $Commit -Path $workflowPath
+    foreach ($actionPath in @(Get-GitSplitWorkflowLocalActionPathsFromText -Text $workflowText)) {
+      if (-not $changedPathSet.Contains($actionPath)) {
+        continue
+      }
+
+      $isGeneratedAction = Test-GitSplitGeneratedPath -Path $actionPath -Commit $Commit
+      Add-GitSplitDependencyEdge -Edges $edges -SeenKeys $seenKeys -SourcePath $workflowPath -TargetPath $actionPath -Rule WorkflowLocalAction -IsGeneratedTarget:$isGeneratedAction
+      if (-not $isGeneratedAction) {
+        Add-GitSplitDependencyEdge -Edges $edges -SeenKeys $seenKeys -SourcePath $actionPath -TargetPath $workflowPath -Rule WorkflowLocalAction
+      }
+    }
+  }
+
+  $codePaths = @(
+    $ChangedPaths |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_ } |
+      Where-Object { [System.IO.Path]::GetExtension($_) -in @('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.vue') }
+  )
+  foreach ($codePath in $codePaths) {
+    if (Test-GitSplitGeneratedPath -Path $codePath -Commit $Commit) {
+      continue
+    }
+
+    $text = Get-GitSplitFileContentAtCommit -Commit $Commit -Path $codePath
+    foreach ($relativeImport in @(Get-GitSplitRelativeImportsFromText -Text $text)) {
+      foreach ($resolvedCandidate in @(Resolve-GitSplitImportCandidates -RepoRoot $RepoRoot -ImporterPath $codePath -Specifier $relativeImport)) {
+        if (-not $changedPathSet.Contains($resolvedCandidate)) {
+          continue
+        }
+
+        $isGeneratedCandidate = Test-GitSplitGeneratedPath -Path $resolvedCandidate -Commit $Commit
+        Add-GitSplitDependencyEdge -Edges $edges -SeenKeys $seenKeys -SourcePath $codePath -TargetPath $resolvedCandidate -Rule RelativeImport -IsGeneratedTarget:$isGeneratedCandidate
+      }
+    }
+  }
+
+  return $edges.ToArray()
+}
+
+function Select-GitSplitPaths {
+  <#
+  .SYNOPSIS
+  Selects changed paths from a single commit using regex filters.
+
+  .DESCRIPTION
+  Returns changed repo-relative paths whose path and/or patch text match the provided regular
+  expressions. Generated files are excluded by default so callers can start from source files
+  before running closure or validation.
+  #>
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter()]
+    [string[]]$PathPattern,
+
+    [Parameter()]
+    [string[]]$PatchPattern,
+
+    [Parameter()]
+    [switch]$IncludeGenerated
+  )
+
+  if ((-not $PathPattern -or $PathPattern.Count -eq 0) -and (-not $PatchPattern -or $PatchPattern.Count -eq 0)) {
+    throw 'Select-GitSplitPaths requires at least one -PathPattern or -PatchPattern.'
+  }
+
+  $commitInfo = Get-GitSplitChangedCommitInfo -Ref $Ref
+  $results = New-Object 'System.Collections.Generic.List[object]'
+
+  foreach ($filePatch in @($commitInfo.FilePatches)) {
+    $path = ConvertTo-GitSplitRepoRelativePath -Path $filePatch.FilePath
+    $isGenerated = Test-GitSplitGeneratedPath -Path $path -Commit $commitInfo.Commit
+    if ($isGenerated -and -not $IncludeGenerated) {
+      continue
+    }
+
+    $matchedPathPattern = $null
+    if ($PathPattern -and $PathPattern.Count -gt 0) {
+      foreach ($pattern in $PathPattern) {
+        if ($path -match $pattern) {
+          $matchedPathPattern = $pattern
+          break
+        }
+      }
+
+      if (-not $matchedPathPattern) {
+        continue
+      }
+    }
+
+    $matchedPatchPattern = $null
+    if ($PatchPattern -and $PatchPattern.Count -gt 0) {
+      $diffSection = Get-GitFileDiffSection -CombinedPatch $commitInfo.PatchText -FilePath $path
+      foreach ($pattern in $PatchPattern) {
+        if ($diffSection -match $pattern) {
+          $matchedPatchPattern = $pattern
+          break
+        }
+      }
+
+      if (-not $matchedPatchPattern) {
+        continue
+      }
+    }
+
+    $results.Add([PSCustomObject]@{
+        Path                = $path
+        IsGenerated         = $isGenerated
+        MatchedPathPattern  = $matchedPathPattern
+        MatchedPatchPattern = $matchedPatchPattern
+      }) | Out-Null
+  }
+
+  return $results.ToArray()
+}
+
+function Get-GitSplitClosure {
+  <#
+  .SYNOPSIS
+  Computes a first-pass dependency closure for selected files within a single commit.
+
+  .DESCRIPTION
+  Expands an explicit set of selected file paths to include deterministic companion files in the
+  same commit. The current PoC focuses on the ImmyBot-style TypeScript/Vue/Bun stack:
+
+  - excludes generated files by default
+  - follows relative imports among changed TypeScript/JavaScript/Vue files
+  - couples changed package.json selections to a changed root bun.lock / bun.lockb
+  - couples changed workflows to changed local GitHub Action definitions
+
+  The closure is intentionally conservative and only considers files that are already part of the
+  target commit diff.
+  #>
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Paths
+  )
+
+  $repoRoot = Get-GitRepoRoot
+  $commitInfo = Get-GitSplitChangedCommitInfo -Ref $Ref
+  $changedPaths = @(
+    $commitInfo.FilePatches |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_.FilePath } |
+      Select-Object -Unique
+  )
+  $changedPathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($changedPath in $changedPaths) {
+    [void]$changedPathSet.Add($changedPath)
+  }
+
+  $edges = @(Get-GitSplitDependencyEdges -RepoRoot $repoRoot -Commit $commitInfo.Commit -ChangedPaths $changedPaths)
+  $edgesBySource = @{}
+  foreach ($edge in $edges) {
+    if (-not $edgesBySource.ContainsKey($edge.SourcePath)) {
+      $edgesBySource[$edge.SourcePath] = @()
+    }
+
+    $edgesBySource[$edge.SourcePath] += $edge
+  }
+
+  $entries = @{}
+  $queue = New-Object System.Collections.Generic.Queue[string]
+  foreach ($inputPath in $Paths) {
+    $normalizedInputPath = ConvertTo-GitSplitRepoRelativePath -Path $inputPath -RepoRoot $repoRoot
+    if (-not $changedPathSet.Contains($normalizedInputPath)) {
+      Add-GitSplitClosureEntry -Entries $entries -Path $normalizedInputPath -Status Excluded -Rule NotChangedInCommit
+      continue
+    }
+
+    $isGenerated = Test-GitSplitGeneratedPath -Path $normalizedInputPath -Commit $commitInfo.Commit
+    if ($isGenerated) {
+      Add-GitSplitClosureEntry -Entries $entries -Path $normalizedInputPath -Status Excluded -Rule GeneratedFile -IsGenerated $true
+      continue
+    }
+
+    Add-GitSplitClosureEntry -Entries $entries -Path $normalizedInputPath -Status Selected -Rule ExplicitSelection
+    $queue.Enqueue($normalizedInputPath)
+  }
+
+  while ($queue.Count -gt 0) {
+    $currentPath = $queue.Dequeue()
+    if (-not $edgesBySource.ContainsKey($currentPath)) {
+      continue
+    }
+
+    foreach ($edge in @($edgesBySource[$currentPath])) {
+      if ($edge.IsGeneratedTarget) {
+        Add-GitSplitClosureEntry -Entries $entries -Path $edge.TargetPath -Status Excluded -Rule GeneratedDependency -SourcePath $currentPath -IsGenerated $true
+        continue
+      }
+
+      if (-not $entries.ContainsKey($edge.TargetPath)) {
+        Add-GitSplitClosureEntry -Entries $entries -Path $edge.TargetPath -Status Included -Rule $edge.Rule -SourcePath $currentPath
+        $queue.Enqueue($edge.TargetPath)
+      }
+    }
+  }
+
+  return @(
+    $entries.Values |
+      Sort-Object `
+        @{ Expression = {
+            switch ($_.Status) {
+              'Selected' { 0 }
+              'Included' { 1 }
+              'Excluded' { 2 }
+              default { 3 }
+            }
+          }
+        },
+        Path
+  )
+}
+
+function Test-GitSplitSelection {
+  <#
+  .SYNOPSIS
+  Validates a split boundary from both the source and target sides.
+  #>
+  [CmdletBinding()]
+  [OutputType([psobject[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Ref,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Paths,
+
+    [Parameter()]
+    [switch]$SkipClosureExpansion
+  )
+
+  $repoRoot = Get-GitRepoRoot
+  $commitInfo = Get-GitSplitChangedCommitInfo -Ref $Ref
+  $changedPaths = @(
+    $commitInfo.FilePatches |
+      ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_.FilePath } |
+      Select-Object -Unique
+  )
+  $edges = @(Get-GitSplitDependencyEdges -RepoRoot $repoRoot -Commit $commitInfo.Commit -ChangedPaths $changedPaths)
+
+  $selectedSet = New-Object 'System.Collections.Generic.HashSet[string]'
+  if ($SkipClosureExpansion) {
+    foreach ($path in $Paths) {
+      $normalizedPath = ConvertTo-GitSplitRepoRelativePath -Path $path -RepoRoot $repoRoot
+      if (-not (Test-GitSplitGeneratedPath -Path $normalizedPath -Commit $commitInfo.Commit)) {
+        [void]$selectedSet.Add($normalizedPath)
+      }
+    }
+  }
+  else {
+    $closure = @(Get-GitSplitClosure -Ref $commitInfo.Commit -Paths $Paths)
+    foreach ($entry in $closure) {
+      if ($entry.Status -in @('Selected', 'Included')) {
+        [void]$selectedSet.Add($entry.Path)
+      }
+    }
+  }
+
+  $results = New-Object 'System.Collections.Generic.List[object]'
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($edge in $edges) {
+    if ($edge.IsGeneratedTarget) {
+      continue
+    }
+
+    $sourceSelected = $selectedSet.Contains($edge.SourcePath)
+    $targetSelected = $selectedSet.Contains($edge.TargetPath)
+    if ($sourceSelected -eq $targetSelected) {
+      continue
+    }
+
+    $impact = if ($sourceSelected) { 'TargetBreakRisk' } else { 'SourceBreakRisk' }
+    $key = '{0}|{1}|{2}|{3}' -f $impact, $edge.SourcePath, $edge.TargetPath, $edge.Rule
+    if (-not $seen.Add($key)) {
+      continue
+    }
+
+    $results.Add([PSCustomObject]@{
+        Impact        = $impact
+        Path          = $edge.SourcePath
+        DependsOnPath = $edge.TargetPath
+        Rule          = $edge.Rule
+      }) | Out-Null
+  }
+
+  return @(
+    $results |
+      Sort-Object Impact, Path, DependsOnPath, Rule
+  )
+}
+
+function Wait-GitSplitPullRequestChecks {
+  <#
+  .SYNOPSIS
+  Waits for GitHub pull request checks by delegating to `gh pr checks --watch`.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$PullRequest,
+
+    [Parameter()]
+    [string]$Repository,
+
+    [Parameter()]
+    [ValidateRange(1, 3600)]
+    [int]$IntervalSeconds = 10,
+
+    [Parameter()]
+    [switch]$FailFast,
+
+    [Parameter()]
+    [switch]$Required
+  )
+
+  if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw "GitHub CLI 'gh' is required for Wait-GitSplitPullRequestChecks."
+  }
+
+  $ghArgs = @('pr', 'checks', "$PullRequest", '--watch', '--interval', "$IntervalSeconds")
+  if ($FailFast) {
+    $ghArgs += '--fail-fast'
+  }
+
+  if ($Required) {
+    $ghArgs += '--required'
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($Repository)) {
+    $ghArgs += @('--repo', $Repository)
+  }
+
+  & gh @ghArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw "gh pr checks failed with exit code $LASTEXITCODE."
+  }
+
+  if ([string]::IsNullOrWhiteSpace($Repository)) {
+    return "$PullRequest"
+  }
+
+  return "$Repository#$PullRequest"
+}
+
 function New-SplitCommitPlan {
   [CmdletBinding()]
   param(
@@ -1746,22 +2671,63 @@ function New-SplitCommitPlan {
     throw "No file patches found in commit $target."
   }
 
+  $hunkDescriptors = @(Get-GitSplitHunkDescriptors -Commit $target -FilePatches $filePatches)
+  $hunkDescriptorById = @{}
+  foreach ($hunkDescriptor in $hunkDescriptors) {
+    $hunkDescriptorById[$hunkDescriptor.HunkId] = $hunkDescriptor
+  }
+
   $rangesByPath = @{}
   foreach ($range in $NewCommitRanges) {
     if ($null -eq $range) {
       continue
     }
 
-    $path = $range.Path
-    if (-not $path) {
-      throw 'NewCommitRanges elements must include Path.'
+    $path = $null
+    $resolvedHunkDescriptor = $null
+    $hunkId = $null
+    if (($range.PSObject.Properties.Name -contains 'HunkId') -and -not [string]::IsNullOrWhiteSpace([string]$range.HunkId)) {
+      $hunkId = [string]$range.HunkId
     }
+    elseif (($range.PSObject.Properties.Name -contains 'Hunk') -and -not [string]::IsNullOrWhiteSpace([string]$range.Hunk)) {
+      $hunkId = [string]$range.Hunk
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($hunkId)) {
+      if (-not $hunkDescriptorById.ContainsKey($hunkId)) {
+        throw "Split-Commit could not resolve HunkId '$hunkId' in commit $target."
+      }
+
+      $resolvedHunkDescriptor = $hunkDescriptorById[$hunkId]
+      $path = $resolvedHunkDescriptor.Path
+    }
+    elseif (($range.PSObject.Properties.Name -contains 'Path') -and -not [string]::IsNullOrWhiteSpace([string]$range.Path)) {
+      $path = ConvertTo-GitSplitRepoRelativePath -Path $range.Path -RepoRoot $repoRoot
+    }
+    else {
+      throw 'NewCommitRanges elements must include Path or HunkId.'
+    }
+
+    if (Test-GitSplitGeneratedPath -Path $path -Commit $target) {
+      throw "Split-Commit does not support generated file '$path'. Select the generator or source file instead."
+    }
+
+    $resolvedRangeProperties = [ordered]@{}
+    foreach ($property in $range.PSObject.Properties) {
+      $resolvedRangeProperties[$property.Name] = $property.Value
+    }
+    $resolvedRangeProperties['Path'] = $path
+    if ($null -ne $resolvedHunkDescriptor) {
+      $resolvedRangeProperties['ResolvedHunkId'] = $resolvedHunkDescriptor.HunkId
+      $resolvedRangeProperties['ResolvedHunkIndex'] = $resolvedHunkDescriptor.PathHunkNumber - 1
+    }
+    $resolvedRange = [PSCustomObject]$resolvedRangeProperties
 
     if (-not $rangesByPath.ContainsKey($path)) {
       $rangesByPath[$path] = @()
     }
 
-    $rangesByPath[$path] += $range
+    $rangesByPath[$path] += $resolvedRange
   }
 
   $perFilePieces = @{}
@@ -1769,6 +2735,13 @@ function New-SplitCommitPlan {
     $path = $filePatch.FilePath
     $hunks = @($filePatch.Patches)
     $pathRanges = if ($rangesByPath.ContainsKey($path)) { @($rangesByPath[$path]) } else { @() }
+    $hunkSelectors = @(
+      $pathRanges |
+        Where-Object {
+          ($_.PSObject.Properties.Name -contains 'ResolvedHunkIndex') -and
+          $null -ne $_.ResolvedHunkIndex
+        }
+    )
     $splitPoints = @()
     if ($pathRanges.Count -gt 0) {
       $splitPoints = @(
@@ -1780,6 +2753,68 @@ function New-SplitCommitPlan {
           } |
           Sort-Object { [int]$_.Line }
       )
+    }
+
+    if ($hunkSelectors.Count -gt 0) {
+      if ($splitPoints.Count -gt 0) {
+        throw "Split-Commit does not support mixing HunkId and Line selectors for path '$path'."
+      }
+
+      if ($pathRanges.Count -ne $hunkSelectors.Count) {
+        throw "Split-Commit does not support mixing HunkId and path-level selectors for '$path'."
+      }
+
+      $pieceByHunkIndex = @{}
+      $maxPiece = 1
+      foreach ($hunkSelector in $hunkSelectors) {
+        $piecePropertyName = $null
+        if ($hunkSelector.PSObject.Properties.Name -contains 'PieceNumber') {
+          $piecePropertyName = 'PieceNumber'
+        }
+        elseif ($hunkSelector.PSObject.Properties.Name -contains 'Piece') {
+          $piecePropertyName = 'Piece'
+        }
+
+        if (-not $piecePropertyName) {
+          throw "Split-Commit: HunkId '$($hunkSelector.ResolvedHunkId)' for path '$path' must include PieceNumber."
+        }
+
+        $pieceNumberValue = $hunkSelector.$piecePropertyName
+        if ($null -eq $pieceNumberValue -or [string]::IsNullOrWhiteSpace([string]$pieceNumberValue)) {
+          throw "Split-Commit: HunkId '$($hunkSelector.ResolvedHunkId)' for path '$path' must include PieceNumber."
+        }
+
+        $pieceNumber = [int]$pieceNumberValue
+        if ($pieceNumber -lt 1) {
+          throw "Split-Commit: PieceNumber for path '$path' must be at least 1."
+        }
+
+        $hunkIndex = [int]$hunkSelector.ResolvedHunkIndex
+        if ($pieceByHunkIndex.ContainsKey($hunkIndex)) {
+          throw "Split-Commit: HunkId '$($hunkSelector.ResolvedHunkId)' for path '$path' was specified multiple times."
+        }
+
+        $pieceByHunkIndex[$hunkIndex] = $pieceNumber
+        if ($pieceNumber -gt $maxPiece) {
+          $maxPiece = $pieceNumber
+        }
+      }
+
+      $pieceGroups = @()
+      for ($pieceIndex = 1; $pieceIndex -le $maxPiece; $pieceIndex++) {
+        $pieceGroups += ,@()
+      }
+
+      for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
+        $pieceNumber = if ($pieceByHunkIndex.ContainsKey($hunkIndex)) { [int]$pieceByHunkIndex[$hunkIndex] } else { 1 }
+        $pieceGroups[$pieceNumber - 1] = @($pieceGroups[$pieceNumber - 1] + $hunks[$hunkIndex])
+      }
+
+      $perFilePieces[$path] = [pscustomobject]@{
+        StartPiece  = 1
+        PieceGroups = @($pieceGroups | ForEach-Object { [object[]]@($_) })
+      }
+      continue
     }
 
     $pieceNumbers = New-Object System.Collections.Generic.List[int]
@@ -2157,14 +3192,18 @@ function Split-Commit {
   .PARAMETER NewCommitRanges
   One or more split point objects. Each object must include:
     - Path        : file path (as seen in the patch, e.g. 'src/file.txt')
+      or
+    - HunkId      : hunk identifier from `Get-GitSplitHunks -Ref <commit>`
   And either:
     - Line        : 1-based NEW-file line number where the next split piece begins
   Or:
     - PieceNumber : 1-based split piece number that should receive the entire file diff
+                    (when used with Path) or the selected whole hunk (when used with HunkId)
   Optional:
     - Column      : 1-based column for mid-line splitting (defaults to 1)
     - Length      : currently ignored (reserved for future range splitting)
     - Piece       : alias for PieceNumber
+    - Hunk        : alias for HunkId
 
   .PARAMETER OutputScriptPath
   If specified, writes a reviewable PowerShell script with inline split patch artifacts
@@ -2188,10 +3227,18 @@ function Split-Commit {
   )
   $created
 
+  .EXAMPLE
+  # Move a specific existing hunk into the second split commit
+  $targetHunk = Get-GitSplitHunks -Ref HEAD | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
+  $created = Split-Commit -Ref HEAD -NewCommitRanges @(
+    [pscustomobject]@{ HunkId = $targetHunk.HunkId; PieceNumber = 2 }
+  )
+  $created
+
   .NOTES
   - This command performs `git reset --hard` and `git cherry-pick`, and will rewrite commits.
   - Run this only on local branches (or be prepared to force push).
-  - Currently supports splitting only files that have exactly one hunk in the target commit.
+  - Line-based split points currently support only one split-target hunk per file.
   #>
   [CmdletBinding(SupportsShouldProcess = $true)]
   [OutputType([string[]])]
@@ -3355,6 +4402,11 @@ else {
   # PowerShell effectively filters exports through BOTH lists, so keep them aligned
   # to avoid surprising "only the intersection" exports.
   Export-ModuleMember -Function @(
+    'Select-GitSplitPaths'
+    'Test-GitSplitSelection'
+    'Wait-GitSplitPullRequestChecks'
+    'Get-GitSplitClosure'
+    'Get-GitSplitHunks'
     'Split-Hunk'
     'Split-Patch'
     'Split-Commit'

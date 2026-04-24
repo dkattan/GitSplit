@@ -111,6 +111,73 @@ Describe "GitSplit" {
     $global:ProgressPreference = $oldProgressPreference
   }
 
+  function script:New-GitSplitExtendedFixtureCommit {
+    Push-Location $script:TempRepoPath
+    try {
+      New-Item -ItemType Directory -Path 'frontend/src/components/__generated__' -Force | Out-Null
+      New-Item -ItemType Directory -Path '.github/actions/run-frontend' -Force | Out-Null
+      New-Item -ItemType Directory -Path '.github/workflows' -Force | Out-Null
+
+      @(
+        '{'
+        '  "name": "frontend",'
+        '  "private": true'
+        '}'
+      ) | Set-Content -Path 'frontend/package.json'
+
+      @(
+        '{'
+        '  "lockfileVersion": 1'
+        '}'
+      ) | Set-Content -Path 'bun.lock'
+
+      @(
+        '<script setup lang="ts">'
+        "import { useThing } from './useThing';"
+        "import { generated } from './__generated__/fixtures.g';"
+        '</script>'
+        '<template><div>{{ useThing() }} {{ generated }}</div></template>'
+      ) | Set-Content -Path 'frontend/src/components/Thing.vue'
+
+      @(
+        'export function useThing() {'
+        '  return 42;'
+        '}'
+      ) | Set-Content -Path 'frontend/src/components/useThing.ts'
+
+      @(
+        'export const generated = true;'
+      ) | Set-Content -Path 'frontend/src/components/__generated__/fixtures.g.ts'
+
+      @(
+        'name: Run frontend'
+        'runs:'
+        '  using: composite'
+        '  steps:'
+        '    - shell: bash'
+        '      run: echo frontend'
+      ) | Set-Content -Path '.github/actions/run-frontend/action.yml'
+
+      @(
+        'name: Frontend'
+        'on: push'
+        'jobs:'
+        '  test:'
+        '    runs-on: ubuntu-latest'
+        '    steps:'
+        '      - uses: ./.github/actions/run-frontend'
+      ) | Set-Content -Path '.github/workflows/frontend.yml'
+
+      git add frontend/package.json bun.lock frontend/src/components/Thing.vue frontend/src/components/useThing.ts frontend/src/components/__generated__/fixtures.g.ts .github/actions/run-frontend/action.yml .github/workflows/frontend.yml | Out-Null
+      git commit -m "Add extended GitSplit fixture" | Out-Null
+
+      return (git rev-parse HEAD).Trim()
+    }
+    finally {
+      Pop-Location
+    }
+  }
+
   Describe "public exports" {
     It "keeps manifest-based exports aligned with the supported public surface" {
       $manifestPath = Join-Path $PSScriptRoot 'GitSplit.psd1'
@@ -127,15 +194,20 @@ Import-Module '$escapedManifestPath' -Force
       $publicCommands | Should -Be @(
         'Add-Commit'
         'Get-CommitMessageFromChanges'
+        'Get-GitSplitClosure'
+        'Get-GitSplitHunks'
         'Invoke-GitSplitAbsorb'
         'Move-Commit'
         'New-Hunk'
         'New-Range'
         'Remove-Commit'
+        'Select-GitSplitPaths'
         'Set-CommitOrder'
         'Split-Commit'
         'Split-Hunk'
         'Split-Patch'
+        'Test-GitSplitSelection'
+        'Wait-GitSplitPullRequestChecks'
       )
     }
   }
@@ -185,6 +257,306 @@ Import-Module '$escapedManifestPath' -Force
       $bHunk | Should -Match "(?m)^\+b-line-2 \(edited again\)$"
       $bHunk | Should -Match "(?m)^\+b-line-5 \(new in commit 3\)$"
       $bHunk | Should -Not -Match "(?m)^\+b-line-2$"
+    }
+  }
+
+  Describe "Get-GitSplitClosure" {
+    It "excludes generated files and expands Vue/TypeScript and Bun dependencies within a commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        New-Item -ItemType Directory -Path 'frontend/src/components/__generated__' -Force | Out-Null
+
+        @(
+          '{'
+          '  "name": "frontend",'
+          '  "private": true'
+          '}'
+        ) | Set-Content -Path 'frontend/package.json'
+
+        @(
+          '{'
+          '  "lockfileVersion": 1'
+          '}'
+        ) | Set-Content -Path 'bun.lock'
+
+        @(
+          '<script setup lang="ts">'
+          "import { useThing } from './useThing';"
+          "import { generated } from './__generated__/fixtures.g';"
+          '</script>'
+          '<template><div>{{ useThing() }} {{ generated }}</div></template>'
+        ) | Set-Content -Path 'frontend/src/components/Thing.vue'
+
+        @(
+          'export function useThing() {'
+          '  return 42;'
+          '}'
+        ) | Set-Content -Path 'frontend/src/components/useThing.ts'
+
+        @(
+          'export const generated = true;'
+        ) | Set-Content -Path 'frontend/src/components/__generated__/fixtures.g.ts'
+
+        git add frontend/package.json bun.lock frontend/src/components/Thing.vue frontend/src/components/useThing.ts frontend/src/components/__generated__/fixtures.g.ts | Out-Null
+        git commit -m "Add frontend closure fixture" | Out-Null
+        $ref = (git rev-parse HEAD).Trim()
+      }
+      finally {
+        Pop-Location
+      }
+
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Get-GitSplitClosure -Ref $ref -Paths @(
+            'frontend/src/components/Thing.vue'
+            'frontend/package.json'
+            'frontend/src/components/__generated__/fixtures.g.ts'
+          ))
+      }
+      finally {
+        Pop-Location
+      }
+
+      $result | Should -HaveCount 5
+
+      $byPath = @{}
+      foreach ($entry in $result) {
+        $byPath[$entry.Path] = $entry
+      }
+
+      $byPath.Keys | Sort-Object | Should -Be @(
+        'bun.lock'
+        'frontend/package.json'
+        'frontend/src/components/__generated__/fixtures.g.ts'
+        'frontend/src/components/Thing.vue'
+        'frontend/src/components/useThing.ts'
+      )
+
+      $byPath['frontend/src/components/Thing.vue'].Status | Should -Be 'Selected'
+      $byPath['frontend/src/components/Thing.vue'].Rule | Should -Be 'ExplicitSelection'
+
+      $byPath['frontend/package.json'].Status | Should -Be 'Selected'
+      $byPath['frontend/package.json'].Rule | Should -Be 'ExplicitSelection'
+
+      $byPath['frontend/src/components/useThing.ts'].Status | Should -Be 'Included'
+      $byPath['frontend/src/components/useThing.ts'].Rule | Should -Be 'RelativeImport'
+      $byPath['frontend/src/components/useThing.ts'].SourcePath | Should -Be 'frontend/src/components/Thing.vue'
+
+      $byPath['bun.lock'].Status | Should -Be 'Included'
+      $byPath['bun.lock'].Rule | Should -Be 'BunLock'
+      $byPath['bun.lock'].SourcePath | Should -Be 'frontend/package.json'
+
+      $byPath['frontend/src/components/__generated__/fixtures.g.ts'].Status | Should -Be 'Excluded'
+      $byPath['frontend/src/components/__generated__/fixtures.g.ts'].Rule | Should -Be 'GeneratedFile'
+      $byPath['frontend/src/components/__generated__/fixtures.g.ts'].IsGenerated | Should -BeTrue
+    }
+
+    It "includes changed local GitHub actions when selecting a changed workflow" {
+      $ref = New-GitSplitExtendedFixtureCommit
+
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Get-GitSplitClosure -Ref $ref -Paths @('.github/workflows/frontend.yml'))
+      }
+      finally {
+        Pop-Location
+      }
+
+      $result | Should -HaveCount 2
+
+      $byPath = @{}
+      foreach ($entry in $result) {
+        $byPath[$entry.Path] = $entry
+      }
+
+      $byPath['.github/workflows/frontend.yml'].Status | Should -Be 'Selected'
+      $byPath['.github/actions/run-frontend/action.yml'].Status | Should -Be 'Included'
+      $byPath['.github/actions/run-frontend/action.yml'].Rule | Should -Be 'WorkflowLocalAction'
+      $byPath['.github/actions/run-frontend/action.yml'].SourcePath | Should -Be '.github/workflows/frontend.yml'
+    }
+  }
+
+  Describe "Get-GitSplitHunks" {
+    It "returns stable hunk identifiers and metadata for a commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $first = @(Get-GitSplitHunks -Ref 'HEAD~1')
+        $second = @(Get-GitSplitHunks -Ref 'HEAD~1')
+      }
+      finally {
+        Pop-Location
+      }
+
+      $first | Should -HaveCount 2
+      $second | Should -HaveCount 2
+      ($first.HunkId) | Should -Be ($second.HunkId)
+      @($first | Where-Object { $_.HunkId -notmatch '^h[0-9a-f]{12}$' }) | Should -BeNullOrEmpty
+
+      $aHunk = $first | Where-Object Path -eq 'a.txt'
+      $bHunk = $first | Where-Object Path -eq 'b.txt'
+
+      $aHunk | Should -Not -BeNullOrEmpty
+      $bHunk | Should -Not -BeNullOrEmpty
+      $aHunk.NewStart | Should -Be 1
+      $bHunk.NewStart | Should -Be 1
+      $aHunk.IsGenerated | Should -BeFalse
+      $bHunk.IsGenerated | Should -BeFalse
+      $aHunk.Preview | Should -Match 'a-line-2'
+      $bHunk.Preview | Should -Match 'b-line-2'
+    }
+  }
+
+  Describe "Generated file detection" {
+    It "reads linguist-generated attributes from the analyzed commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        'tracked content' | Set-Content -Path 'tracked.txt'
+        git add tracked.txt | Out-Null
+        git commit -m "Add tracked.txt" | Out-Null
+        $historicalRef = (git rev-parse HEAD).Trim()
+
+        '*.txt linguist-generated=true' | Set-Content -Path '.gitattributes'
+        git add .gitattributes | Out-Null
+        git commit -m "Mark txt files generated" | Out-Null
+
+        $hunks = @(Get-GitSplitHunks -Ref $historicalRef)
+        $selected = @(Select-GitSplitPaths -Ref $historicalRef -PathPattern '^tracked\.txt$')
+        $closure = @(Get-GitSplitClosure -Ref $historicalRef -Paths @('tracked.txt'))
+      }
+      finally {
+        Pop-Location
+      }
+
+      $hunks | Should -HaveCount 1
+      $hunks[0].Path | Should -Be 'tracked.txt'
+      $hunks[0].IsGenerated | Should -BeFalse
+
+      $selected | Should -HaveCount 1
+      $selected[0].Path | Should -Be 'tracked.txt'
+      $selected[0].IsGenerated | Should -BeFalse
+
+      $closure | Should -HaveCount 1
+      $closure[0].Path | Should -Be 'tracked.txt'
+      $closure[0].Status | Should -Be 'Selected'
+      $closure[0].IsGenerated | Should -BeFalse
+    }
+  }
+
+  Describe "Select-GitSplitPaths" {
+    It "selects changed paths by regex and excludes generated files by default" {
+      $ref = New-GitSplitExtendedFixtureCommit
+
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Select-GitSplitPaths -Ref $ref -PathPattern '^frontend/src/components/.*')
+      }
+      finally {
+        Pop-Location
+      }
+
+      ($result.Path | Sort-Object) | Should -Be @(
+        'frontend/src/components/Thing.vue'
+        'frontend/src/components/useThing.ts'
+      )
+      ($result | Where-Object Path -eq 'frontend/src/components/__generated__/fixtures.g.ts') | Should -BeNullOrEmpty
+    }
+  }
+
+  Describe "Test-GitSplitSelection" {
+    It "reports source and target risks when a known coupling is split without closure expansion" {
+      $ref = New-GitSplitExtendedFixtureCommit
+
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Test-GitSplitSelection -Ref $ref -Paths @('frontend/package.json') -SkipClosureExpansion)
+      }
+      finally {
+        Pop-Location
+      }
+
+      $result | Should -HaveCount 2
+      ($result | Where-Object { $_.Impact -eq 'TargetBreakRisk' -and $_.Path -eq 'frontend/package.json' -and $_.DependsOnPath -eq 'bun.lock' -and $_.Rule -eq 'BunLock' }) | Should -Not -BeNullOrEmpty
+      ($result | Where-Object { $_.Impact -eq 'SourceBreakRisk' -and $_.Path -eq 'bun.lock' -and $_.DependsOnPath -eq 'frontend/package.json' -and $_.Rule -eq 'BunLock' }) | Should -Not -BeNullOrEmpty
+    }
+
+    It "clears known Bun coupling risks after closure expansion" {
+      $ref = New-GitSplitExtendedFixtureCommit
+
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Test-GitSplitSelection -Ref $ref -Paths @('frontend/package.json'))
+      }
+      finally {
+        Pop-Location
+      }
+
+      ($result | Where-Object Rule -eq 'BunLock') | Should -BeNullOrEmpty
+    }
+  }
+
+  Describe "Wait-GitSplitPullRequestChecks" {
+    It "passes the expected flags through to gh pr checks" {
+      $global:capturedArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+        $global:capturedArgs = $Args
+      }
+
+      try {
+        $result = Wait-GitSplitPullRequestChecks -PullRequest 123 -Repository 'owner/repo' -IntervalSeconds 7 -FailFast -Required
+      }
+      finally {
+        Remove-Item Function:\gh -ErrorAction SilentlyContinue
+      }
+
+      $global:capturedArgs | Should -Be @(
+        'pr'
+        'checks'
+        '123'
+        '--watch'
+        '--interval'
+        '7'
+        '--fail-fast'
+        '--required'
+        '--repo'
+        'owner/repo'
+      )
+      $result | Should -Be 'owner/repo#123'
+      Remove-Variable -Name capturedArgs -Scope Global -ErrorAction SilentlyContinue
+    }
+  }
+
+  Describe "Split-Commit generated files" {
+    It "rejects generated files before attempting to split them" {
+      Push-Location $script:TempRepoPath
+      try {
+        New-Item -ItemType Directory -Path 'generated' -Force | Out-Null
+        @(
+          'before'
+          'after'
+        ) | Set-Content -Path 'generated/output.generated.ts'
+
+        git add generated/output.generated.ts | Out-Null
+        git commit -m "Add generated output" | Out-Null
+        $ref = (git rev-parse HEAD).Trim()
+        $generatedHunk = @(Get-GitSplitHunks -Ref $ref | Where-Object Path -eq 'generated/output.generated.ts')
+        $generatedHunk | Should -HaveCount 1
+
+        {
+          Split-Commit -Ref $ref -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'generated/output.generated.ts'; PieceNumber = 2 }
+          )
+        } | Should -Throw "*does not support generated file*"
+
+        {
+          Split-Commit -Ref $ref -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $generatedHunk[0].HunkId; PieceNumber = 2 }
+          )
+        } | Should -Throw "*does not support generated file*"
+      }
+      finally {
+        Pop-Location
+      }
     }
   }
 
@@ -694,6 +1066,75 @@ Import-Module '$escapedManifestPath' -Force
   }
 
   Describe "Split-Commit multi-hunk files" {
+    It "can assign a specific hunk to a later split piece by HunkId" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Add multi.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multi.txt'
+
+        git add multi.txt | Out-Null
+        git commit -m 'Modify multi.txt in two hunks' | Out-Null
+
+        $targetHunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1)
+        $targetHunk | Should -HaveCount 1
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $targetHunk[0].HunkId; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+
+        $first = @(Get-Content -Path 'multi.txt')
+        $first[1] | Should -Be 'line-2 changed'
+        $first[9] | Should -Be 'line-10'
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+
+        $final = @(Get-Content -Path 'multi.txt')
+        $final[1] | Should -Be 'line-2 changed'
+        $final[9] | Should -Be 'line-10 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
     It "can split a later hunk in a multi-hunk file" {
       Push-Location $script:TempRepoPath
       try {

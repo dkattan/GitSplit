@@ -22,6 +22,77 @@ Import-Module "./GitSplit.psd1" -Force
 
 ## Commands
 
+### `Select-GitSplitPaths`
+
+Selects changed paths from a single commit using regex filters.
+
+- matches changed paths via `-PathPattern`
+- optionally filters by diff text via `-PatchPattern`
+- excludes generated files by default
+
+```powershell
+$selection = Select-GitSplitPaths -Ref HEAD `
+  -PathPattern '^frontend/.*\.(vue|ts)$' `
+  -PatchPattern 'useThing|workflow'
+
+$selection | Format-Table Path, MatchedPathPattern, MatchedPatchPattern
+```
+
+### `Get-GitSplitClosure`
+
+Computes a first-pass dependency closure for selected files within a single commit.
+
+Current PoC behavior:
+
+- excludes generated files by default
+- follows relative imports among changed TypeScript/JavaScript/Vue files
+- couples changed `package.json` selections to a changed root `bun.lock` / `bun.lockb`
+- couples changed workflows to changed local GitHub Action definitions
+
+```powershell
+$closure = Get-GitSplitClosure -Ref HEAD -Paths @(
+  'frontend/src/components/Thing.vue',
+  'frontend/package.json'
+)
+
+$closure | Format-Table Path, Status, Rule, SourcePath, IsGenerated
+```
+
+### `Get-GitSplitHunks`
+
+Enumerates changed hunks in a commit and assigns stable IDs that are easy to pass back over the CLI.
+
+```powershell
+$hunks = Get-GitSplitHunks -Ref HEAD
+$hunks | Format-Table HunkId, Path, NewStart, NewCount, Preview
+```
+
+### `Test-GitSplitSelection`
+
+Runs a lightweight two-sided validation pass over a selected split boundary.
+
+- `TargetBreakRisk`: selected files still depend on unselected changed files
+- `SourceBreakRisk`: unselected changed files still depend on selected files
+
+```powershell
+$risks = Test-GitSplitSelection -Ref HEAD -Paths @(
+  'frontend/src/components/Thing.vue',
+  'frontend/package.json'
+)
+
+$risks | Format-Table Impact, Path, DependsOnPath, Rule
+```
+
+### `Wait-GitSplitPullRequestChecks`
+
+Delegates to `gh pr checks --watch` so you can keep PR check waiting inside the GitSplit surface.
+
+> Note: requires GitHub CLI (`gh`) on `PATH`.
+
+```powershell
+Wait-GitSplitPullRequestChecks -PullRequest 1234 -Repository owner/repo -Required -FailFast
+```
+
 ### `Split-Patch`
 
 Splits a unified diff (containing one or more `diff --git` sections) into per-file hunks.
@@ -63,6 +134,16 @@ $created
 # Move an entire file diff into the second split piece
 $created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
   [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+)
+$created
+
+# Assign a specific existing hunk to the second split piece by ID
+$targetHunk = Get-GitSplitHunks -Ref HEAD |
+  Where-Object Path -eq 'multi.txt' |
+  Select-Object -Last 1
+
+$created = Split-Commit -Ref HEAD -NewCommitRanges @(
+  [pscustomobject]@{ HunkId = $targetHunk.HunkId; PieceNumber = 2 }
 )
 $created
 

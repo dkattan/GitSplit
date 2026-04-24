@@ -10,6 +10,11 @@
   PowerShellVersion = '5.1'
 
   FunctionsToExport = @(
+    'Select-GitSplitPaths'
+    'Test-GitSplitSelection'
+    'Wait-GitSplitPullRequestChecks'
+    'Get-GitSplitClosure'
+    'Get-GitSplitHunks'
     'Split-Patch'
     'Split-Hunk'
     'Split-Commit'
@@ -31,11 +36,7 @@
       Tags         = @('git', 'diff', 'patch', 'hunk', 'pester')
       LicenseUri   = 'https://opensource.org/license/mit/'
       ProjectUri   = 'https://github.com/dkattan/GitSplit'
-      ReleaseNotes = 'Export patch/hunk helpers and absorb helper for advanced PR splitting workflows.'
+      ReleaseNotes = 'Add deterministic selection, closure, hunk ID, and PR check helpers for advanced PR splitting workflows.'
     }
   }
 }
-
-
-
-
