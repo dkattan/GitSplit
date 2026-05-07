@@ -200,6 +200,7 @@ Import-Module '$escapedManifestPath' -Force
         'Move-Commit'
         'New-Hunk'
         'New-Range'
+        'New-SplitCommitRange'
         'Remove-Commit'
         'Select-GitSplitPaths'
         'Set-CommitOrder'
@@ -257,6 +258,33 @@ Import-Module '$escapedManifestPath' -Force
       $bHunk | Should -Match "(?m)^\+b-line-2 \(edited again\)$"
       $bHunk | Should -Match "(?m)^\+b-line-5 \(new in commit 3\)$"
       $bHunk | Should -Not -Match "(?m)^\+b-line-2$"
+    }
+  }
+
+  Describe "New-SplitCommitRange" {
+    It "creates a line-based Split-Commit selector without raw object literals" {
+      $range = New-SplitCommitRange -Path 'b.txt' -Line 5
+
+      $range.Path | Should -Be 'b.txt'
+      $range.Line | Should -Be 5
+      $range.PSObject.Properties.Name | Should -Contain 'Path'
+      $range.PSObject.Properties.Name | Should -Contain 'Line'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Column'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Length'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'PieceNumber'
+    }
+
+    It "creates hunk and piece selectors using the canonical property names" {
+      $range = New-SplitCommitRange -HunkId 'abc123' -Piece 2
+
+      $range.HunkId | Should -Be 'abc123'
+      $range.PieceNumber | Should -Be 2
+      $range.PSObject.Properties.Name | Should -Contain 'HunkId'
+      $range.PSObject.Properties.Name | Should -Contain 'PieceNumber'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Hunk'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Piece'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Path'
+      $range.PSObject.Properties.Name | Should -Not -Contain 'Line'
     }
   }
 
@@ -1632,7 +1660,7 @@ Import-Module '$escapedManifestPath' -Force
       Push-Location $script:TempRepoPath
       try {
         { Move-Commit -CommitRef HEAD -DestinationBranch 'missing-dest' } |
-          Should -Throw -ExpectedMessage "*Destination branch 'missing-dest' does not exist locally or on origin.*git branch missing-dest <base-ref>*-CreateDestinationBranch -BaseRef <base-ref>*"
+          Should -Throw -ExpectedMessage "*Destination branch 'missing-dest' does not exist locally or on origin.*git branch missing-dest <base-ref>*-CreateDestinationBranch -BaseRef <base-ref>*@{upstream}*quote it*"
       }
       finally {
         Pop-Location

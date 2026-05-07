@@ -399,6 +399,7 @@ function Get-MoveCommitMissingDestinationBranchMessage {
     "  git branch $DestinationBranch <base-ref>"
     "Or rerun with:"
     "  Move-Commit -DestinationBranch $DestinationBranch -CreateDestinationBranch -BaseRef <base-ref>"
+    "If <base-ref> contains PowerShell-special characters (for example '@{upstream}'), quote it."
   ) -join [Environment]::NewLine
 }
 
@@ -1796,6 +1797,115 @@ function New-Range {
   $obj | Add-Member -MemberType ScriptMethod -Name 'ToString' -Value { $this._ToString } -Force
 
   return $obj
+}
+
+function New-SplitCommitRange {
+  <#
+  .SYNOPSIS
+  Creates a selector object for Split-Commit -NewCommitRanges.
+
+  .DESCRIPTION
+  Builds a PSCustomObject in the shape expected by Split-Commit, so callers do not
+  have to write raw `[pscustomobject]@{ ... }` literals for common split selectors.
+
+  Use -Path with -Line to split a file at a specific NEW-file line, -Path with
+  -PieceNumber to move a whole-file diff into a later split piece, or -HunkId with
+  -PieceNumber to move a specific hunk into a later piece.
+
+  .PARAMETER Path
+  File path as seen in the patch (for example 'src/file.txt'). Absolute paths inside
+  the repository are also accepted and normalized by Split-Commit.
+
+  .PARAMETER HunkId
+  Hunk identifier from `Get-GitSplitHunks -Ref <commit>`.
+
+  .PARAMETER Line
+  1-based NEW-file line number where the next split piece begins.
+
+  .PARAMETER Column
+  Optional 1-based column for mid-line splitting. Defaults to 1.
+
+  .PARAMETER Length
+  Currently ignored by Split-Commit and reserved for future range splitting.
+
+  .PARAMETER PieceNumber
+  1-based split piece number that should receive the whole file diff (when used with
+  -Path) or the selected hunk (when used with -HunkId).
+
+  .OUTPUTS
+  System.Management.Automation.PSCustomObject
+  Object shaped for Split-Commit -NewCommitRanges.
+
+  .EXAMPLE
+  # Split HEAD's b.txt changes so NEW-file line 2 begins a new commit
+  $range = New-SplitCommitRange -Path 'b.txt' -Line 2
+
+  .EXAMPLE
+  # Move an entire file diff into the second split piece
+  $range = New-SplitCommitRange -Path 'b.txt' -PieceNumber 2
+
+  .EXAMPLE
+  # Move a specific existing hunk into the second split piece
+  $targetHunk = Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
+  $range = New-SplitCommitRange -HunkId $targetHunk.HunkId -PieceNumber 2
+  #>
+  [CmdletBinding(DefaultParameterSetName = 'PathLine')]
+  [OutputType([psobject])]
+  param(
+    [Parameter(Mandatory = $true, ParameterSetName = 'PathLine')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'PathPiece')]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'HunkPiece')]
+    [Alias('Hunk')]
+    [ValidateNotNullOrEmpty()]
+    [string]$HunkId,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'PathLine')]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$Line,
+
+    [Parameter(ParameterSetName = 'PathLine')]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$Column = 1,
+
+    [Parameter(ParameterSetName = 'PathLine')]
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$Length = 0,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'PathPiece')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'HunkPiece')]
+    [Alias('Piece')]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$PieceNumber
+  )
+
+  $properties = [ordered]@{}
+
+  if ($PSCmdlet.ParameterSetName -eq 'HunkPiece') {
+    $properties['HunkId'] = $HunkId
+    $properties['PieceNumber'] = $PieceNumber
+    return [PSCustomObject]$properties
+  }
+
+  $properties['Path'] = $Path
+
+  if ($PSCmdlet.ParameterSetName -eq 'PathPiece') {
+    $properties['PieceNumber'] = $PieceNumber
+    return [PSCustomObject]$properties
+  }
+
+  $properties['Line'] = $Line
+  if ($PSBoundParameters.ContainsKey('Column')) {
+    $properties['Column'] = $Column
+  }
+
+  if ($PSBoundParameters.ContainsKey('Length')) {
+    $properties['Length'] = $Length
+  }
+
+  return [PSCustomObject]$properties
 }
 
 function Get-GitFileDiffSection {
@@ -3209,6 +3319,8 @@ function Split-Commit {
     - Piece       : alias for PieceNumber
     - Hunk        : alias for HunkId
 
+  Use `New-SplitCommitRange` to build these objects without raw PowerShell object literals.
+
   .PARAMETER OutputScriptPath
   If specified, writes a reviewable PowerShell script with inline split patch artifacts
   instead of executing the rewrite immediately.
@@ -3219,23 +3331,23 @@ function Split-Commit {
 
   .EXAMPLE
   # Split HEAD's b.txt changes so NEW-file line 2 begins a new commit
-  $created = Split-Commit -Ref HEAD -NewCommitRanges @(
-    [pscustomobject]@{ Path = 'b.txt'; Line = 2 }
+  $created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+    New-SplitCommitRange -Path 'b.txt' -Line 2
   )
   $created
 
   .EXAMPLE
   # Move an entire file diff into the second split commit
-  $created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
-    [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+  $created = Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+    New-SplitCommitRange -Path 'b.txt' -PieceNumber 2
   )
   $created
 
   .EXAMPLE
   # Move a specific existing hunk into the second split commit
-  $targetHunk = Get-GitSplitHunks -Ref HEAD | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
-  $created = Split-Commit -Ref HEAD -NewCommitRanges @(
-    [pscustomobject]@{ HunkId = $targetHunk.HunkId; PieceNumber = 2 }
+  $targetHunk = Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
+  $created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+    New-SplitCommitRange -HunkId $targetHunk.HunkId -PieceNumber 2
   )
   $created
 
@@ -4260,7 +4372,7 @@ function Move-Commit {
 
   .PARAMETER BaseRef
   The base ref to create the destination branch from when -CreateDestinationBranch
-  is specified.
+  is specified. Quote refs like '@{upstream}' when invoking from PowerShell.
 
   .PARAMETER RemoveFromSource
   If specified, removes the commit from the current branch after applying it to the destination.
@@ -4416,6 +4528,7 @@ else {
     'Split-Commit'
     'New-Hunk'
     'New-Range'
+    'New-SplitCommitRange'
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
