@@ -1022,6 +1022,10 @@ function New-MoveCommitPlan {
     'if (-not (Test-Path -LiteralPath $wtRoot)) {'
     '  New-Item -Path $wtRoot -ItemType Directory -Force | Out-Null'
     '}'
+    '$longPathGitArgs = @()'
+    'if ($env:OS -eq ''Windows_NT'') {'
+    '  $longPathGitArgs = @(''-c'', ''core.longpaths=true'')'
+    '}'
     'if (Test-Path -LiteralPath $destWorktreePath) {'
     '  throw "Planned destination worktree path ''$destWorktreePath'' already exists."'
     '}'
@@ -1033,7 +1037,7 @@ function New-MoveCommitPlan {
 
   if ($planCreatesDestinationBranch) {
     $executionLines += @(
-      '  & git worktree add -b $destinationBranch $destWorktreePath $destinationCreateBaseCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  & git @longPathGitArgs worktree add -b $destinationBranch $destWorktreePath $destinationCreateBaseCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '  if ($LASTEXITCODE -ne 0) {'
       '    throw "git worktree add -b $destinationBranch $destinationCreateBaseCommit failed"'
       '  }'
@@ -1042,13 +1046,13 @@ function New-MoveCommitPlan {
   else {
     $executionLines += @(
       '  if ($useRemoteTrackingBranch) {'
-      '    & git worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    & git @longPathGitArgs worktree add -b $destinationBranch $destWorktreePath "origin/$destinationBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '    if ($LASTEXITCODE -ne 0) {'
       '      throw "git worktree add -b $destinationBranch failed"'
       '    }'
       '  }'
       '  else {'
-      '    & git worktree add $destWorktreePath $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    & git @longPathGitArgs worktree add $destWorktreePath $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '    if ($LASTEXITCODE -ne 0) {'
       '      throw "git worktree add $destinationBranch failed"'
       '    }'
@@ -1058,7 +1062,7 @@ function New-MoveCommitPlan {
 
   $executionLines += @(
     '  $destWorktreeCreated = $true'
-    '  & git -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  & git @longPathGitArgs -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
     '    throw "git -C <worktree> cherry-pick failed for $commitHash"'
     '  }'
@@ -1077,7 +1081,7 @@ function New-MoveCommitPlan {
       '  if (Test-Path -LiteralPath $sourceWorktreePath) {'
       '    throw "Planned source worktree path ''$sourceWorktreePath'' already exists."'
       '  }'
-      '  & git worktree add --detach $sourceWorktreePath $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  & git @longPathGitArgs worktree add --detach $sourceWorktreePath $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '  if ($LASTEXITCODE -ne 0) {'
       '    throw "git worktree add --detach failed for source branch $expectedBranch"'
       '  }'
@@ -1091,7 +1095,7 @@ function New-MoveCommitPlan {
     }
     else {
       $executionLines += @(
-        '  & git -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+        '  & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
         '  if ($LASTEXITCODE -ne 0) {'
         '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"'
         '  }'
@@ -1107,7 +1111,7 @@ function New-MoveCommitPlan {
       '  if ($LASTEXITCODE -ne 0) {'
       '    throw "git update-ref failed while rewriting $expectedBranch"'
       '  }'
-      '  & git reset --hard "refs/heads/$expectedBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  & git @longPathGitArgs reset --hard "refs/heads/$expectedBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '  if ($LASTEXITCODE -ne 0) {'
       '    throw "git reset --hard failed while synchronizing $expectedBranch"'
       '  }'
@@ -1142,7 +1146,7 @@ function New-MoveCommitPlan {
   if ($sourceRemovalPlan) {
     $executionLines += @(
       '  if ($moveSucceeded -and $sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
-      '    & git worktree remove --force $sourceWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    & git @longPathGitArgs worktree remove --force $sourceWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '    if ($LASTEXITCODE -ne 0) {'
       '      throw "git worktree remove --force failed for ''$sourceWorktreePath''."'
       '    }'
@@ -1156,7 +1160,7 @@ function New-MoveCommitPlan {
 
   $executionLines += @(
     '  if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
-    '    & git worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '    if ($LASTEXITCODE -ne 0) {'
     '      throw "git worktree remove --force failed for ''$destWorktreePath''."'
     '    }'
