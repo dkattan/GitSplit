@@ -126,32 +126,36 @@ Rewrites history by splitting a commit into multiple commits based on hunk split
 > Warning: this rewrites history. Use on local branches (or be prepared to force push).
 
 ```powershell
-$created = Split-Commit -Ref HEAD -NewCommitRanges @(
-  [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+$created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+  New-SplitCommitRange -Path 'b.txt' -Line 5
 )
 $created
 
 # Move an entire file diff into the second split piece
-$created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
-  [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+$created = Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+  New-SplitCommitRange -Path 'b.txt' -PieceNumber 2
 )
 $created
 
 # Assign a specific existing hunk to the second split piece by ID
-$targetHunk = Get-GitSplitHunks -Ref HEAD |
+$targetHunk = Get-GitSplitHunks -Ref 'HEAD' |
   Where-Object Path -eq 'multi.txt' |
   Select-Object -Last 1
 
-$created = Split-Commit -Ref HEAD -NewCommitRanges @(
-  [pscustomobject]@{ HunkId = $targetHunk.HunkId; PieceNumber = 2 }
+$created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+  New-SplitCommitRange -HunkId $targetHunk.HunkId -PieceNumber 2
 )
 $created
 
 # Generate a reviewable split script now and execute it later
-Split-Commit -Ref HEAD -NewCommitRanges @(
-  [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+  New-SplitCommitRange -Path 'b.txt' -Line 5
 ) -OutputScriptPath ./split-commit.ps1
 ```
+
+### `New-SplitCommitRange`
+
+Creates selector objects for `Split-Commit -NewCommitRanges` without raw `[pscustomobject]@{ ... }` literals.
 
 ### `New-Hunk`
 
@@ -201,6 +205,9 @@ This is meant to pair with `Split-Commit`:
 >
 > By default, `Move-Commit` fails if the destination branch does not already exist.
 > To create it intentionally, use `-CreateDestinationBranch -BaseRef <ref>`.
+>
+> If a ref contains PowerShell-special characters (for example `@{upstream}`), quote it:
+> `-BaseRef '@{upstream}'`.
 
 ```powershell
 # Copy HEAD to another branch (no branch switching in your current worktree)
@@ -210,7 +217,10 @@ Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted
 Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -RemoveFromSource
 
 # Create the destination branch from origin/main, then move HEAD onto it
-Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -CreateDestinationBranch -BaseRef origin/main
+Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -CreateDestinationBranch -BaseRef 'origin/main'
+
+# Create the destination branch from the current branch's upstream
+Move-Commit -CommitRef HEAD -DestinationBranch feature/extracted -CreateDestinationBranch -BaseRef '@{upstream}'
 
 # Generate a reviewable script now and execute it later
 Move-Commit -CommitRef HEAD~1 -DestinationBranch feature/extracted -OutputScriptPath ./move-commit.ps1
