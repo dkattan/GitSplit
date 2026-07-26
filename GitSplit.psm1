@@ -205,6 +205,20 @@ function Resolve-GitCommit {
   return (Invoke-GitQuery -ErrorMessage $ErrorMessage rev-parse --verify "$Ref^{commit}").Output.Trim()
 }
 
+function Test-GitCheckAttrSupportsSource {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  if ($script:GitSplitCheckAttrSupportsSource -is [bool]) {
+    return $script:GitSplitCheckAttrSupportsSource
+  }
+
+  $helpQuery = Invoke-GitQuery -AllowFailure -GitArgs @('check-attr', '-h')
+  $script:GitSplitCheckAttrSupportsSource = $helpQuery.Output -match '(?m)--\[no-\]source <tree-ish>'
+  return $script:GitSplitCheckAttrSupportsSource
+}
+
 function ConvertTo-GitSplitRepoRelativePath {
   [CmdletBinding()]
   [OutputType([string])]
@@ -277,7 +291,15 @@ function Test-GitSplitGeneratedPath {
   $canInspectAttributes = $true
   $attrGitArgs = @('check-attr')
   if (-not [string]::IsNullOrWhiteSpace($Commit)) {
-    $attrGitArgs += @('--source', $Commit)
+    if (Test-GitCheckAttrSupportsSource) {
+      $attrGitArgs += @('--source', $Commit)
+    }
+    else {
+      $headCommit = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+      if ($headCommit -ne $Commit) {
+        $canInspectAttributes = $false
+      }
+    }
   }
 
   if ($canInspectAttributes) {
@@ -394,6 +416,7 @@ function ConvertTo-PowerShellStringLiteral {
     [string]$Value
   )
 
+  if ($null -eq $Value) { return "''" }
   return "'" + $Value.Replace("'", "''") + "'"
 }
 
@@ -1583,6 +1606,7 @@ function New-Hunk {
   # Unified diff hunk body lines must start with one of: ' ' (context), '+' (add), '-' (remove), or '\\' (no newline marker).
   # A truly blank context line is represented by a single space character, NOT an empty string.
   return $header + "`n" + (($BodyLines | ForEach-Object {
+        if ($null -eq $_) { return ' ' }
         if ($_.Length -eq 0) { return ' ' }
         return $_
       }) -join "`n") + "`n"

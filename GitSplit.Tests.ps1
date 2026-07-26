@@ -5302,6 +5302,11 @@ jobs:
       $result = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 2 -BodyLines @('', '+line')
       $result | Should -Match "(?s)^@@ -1,1 \+1,2 @@`n `n\+line`n$"
     }
+
+    It "converts null body lines to space" {
+      $result = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 2 -BodyLines @($null, '+line')
+      $result | Should -Match "(?s)^@@ -1,1 \+1,2 @@`n `n\+line`n$"
+    }
   }
 
   Describe "Test-GitCommitIsAncestor error handling" {
