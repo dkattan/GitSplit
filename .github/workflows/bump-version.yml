@@ -26,7 +26,7 @@ jobs:
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 6.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion 6.0.0
 
       - name: Run tests
         shell: pwsh
