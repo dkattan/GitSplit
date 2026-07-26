@@ -1423,6 +1423,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 1 should contain a.txt and b.txt changes only (not c.txt)
         git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
         $piece1Files | Should -Not -Contain 'c.txt'
         $piece1Files | Should -Contain 'a.txt'
@@ -1430,6 +1431,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 2 should contain c.txt changes only (not a.txt or b.txt)
         git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
         $piece2Files | Should -Contain 'c.txt'
         $piece2Files | Should -Not -Contain 'a.txt'
@@ -1437,9 +1439,11 @@ Import-Module '$escapedManifestPath' -Force
 
         # c.txt content should only appear in piece 2
         git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         Test-Path 'c.txt' | Should -Be $false
 
         git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         Test-Path 'c.txt' | Should -Be $true
       }
       finally {
@@ -1484,6 +1488,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 1 should contain a.txt and b.txt changes only (not c.txt)
         git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
         $piece1Files | Should -Not -Contain 'c.txt'
         $piece1Files | Should -Contain 'a.txt'
@@ -1491,6 +1496,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 2 should contain c.txt changes only (not a.txt or b.txt)
         git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
         $piece2Files | Should -Contain 'c.txt'
         $piece2Files | Should -Not -Contain 'a.txt'
@@ -1532,11 +1538,13 @@ Import-Module '$escapedManifestPath' -Force
         $created | Should -HaveCount 2
 
         git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
         $piece1Files | Should -Contain 'a.txt'
         $piece1Files | Should -Not -Contain 'b.txt'
 
         git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
         $piece2Files | Should -Contain 'b.txt'
         $piece2Files | Should -Not -Contain 'a.txt'
@@ -1595,6 +1603,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 1: a.txt and b.txt
         git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
         $piece1Files | Should -Contain 'a.txt'
         $piece1Files | Should -Contain 'b.txt'
@@ -1603,6 +1612,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 2: c.txt only
         git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
         $piece2Files | Should -Contain 'c.txt'
         $piece2Files | Should -Not -Contain 'a.txt'
@@ -1611,6 +1621,7 @@ Import-Module '$escapedManifestPath' -Force
 
         # Piece 3: d.txt only
         git checkout --detach -q $created[2] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
         $piece3Files = @(git diff-tree --no-commit-id --name-only -r $created[2])
         $piece3Files | Should -Contain 'd.txt'
         $piece3Files | Should -Not -Contain 'a.txt'

@@ -152,8 +152,8 @@ $created
 # Partition multiple files across independent pieces by HunkId
 $hunks = Get-GitSplitHunks -Ref HEAD
 $created = Split-Commit -Ref HEAD -NewCommitRanges @(
-  [pscustomobject]@{ HunkId = ($hunks | Where-Object Path -eq 'c.txt')[0].HunkId; PieceNumber = 2 }
-  [pscustomobject]@{ HunkId = ($hunks | Where-Object Path -eq 'd.txt')[0].HunkId; PieceNumber = 3 }
+  [pscustomobject]@{ HunkId = @($hunks | Where-Object Path -eq 'c.txt')[0].HunkId; PieceNumber = 2 }
+  [pscustomobject]@{ HunkId = @($hunks | Where-Object Path -eq 'd.txt')[0].HunkId; PieceNumber = 3 }
 )
 $created
 
