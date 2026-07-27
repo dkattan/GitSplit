@@ -1381,6 +1381,258 @@ Import-Module '$escapedManifestPath' -Force
       }
     }
   }
+
+  Describe "Split-Commit partitioned pieces" {
+    It "partitions hunks by HunkId so unassigned hunks default to piece 1" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit that modifies a.txt, b.txt, and a new file c.txt
+        @(
+          'a-line-1'
+          'a-line-2 (partition)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'b-line-1'
+          'b-line-2 (partition)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (partition)'
+        ) | Set-Content -Path 'b.txt'
+
+        @(
+          'c-line-1'
+          'c-line-2'
+        ) | Set-Content -Path 'c.txt'
+
+        git add a.txt b.txt c.txt | Out-Null
+        git commit -m 'Modify a.txt, b.txt, and add c.txt' | Out-Null
+
+        # Assign c.txt's hunk to piece 2; leave a.txt and b.txt unassigned (default piece 1)
+        $cHunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'c.txt')
+        $cHunk | Should -HaveCount 1
+
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $cHunk[0].HunkId; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+
+        # Piece 1 should contain a.txt and b.txt changes only (not c.txt)
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
+        $piece1Files | Should -Not -Contain 'c.txt'
+        $piece1Files | Should -Contain 'a.txt'
+        $piece1Files | Should -Contain 'b.txt'
+
+        # Piece 2 should contain c.txt changes only (not a.txt or b.txt)
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
+        $piece2Files | Should -Contain 'c.txt'
+        $piece2Files | Should -Not -Contain 'a.txt'
+        $piece2Files | Should -Not -Contain 'b.txt'
+
+        # c.txt content should only appear in piece 2
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        Test-Path 'c.txt' | Should -Be $false
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        Test-Path 'c.txt' | Should -Be $true
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "partitions whole files by Path and PieceNumber so each piece is non-cumulative" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit that modifies a.txt, b.txt, and a new file c.txt
+        @(
+          'a-line-1'
+          'a-line-2 (partition)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'b-line-1'
+          'b-line-2 (partition)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (partition)'
+        ) | Set-Content -Path 'b.txt'
+
+        @(
+          'c-line-1'
+          'c-line-2'
+        ) | Set-Content -Path 'c.txt'
+
+        git add a.txt b.txt c.txt | Out-Null
+        git commit -m 'Modify a.txt, b.txt, and add c.txt' | Out-Null
+
+        # Assign c.txt to piece 2; leave a.txt and b.txt unassigned (default piece 1)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'c.txt'; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+
+        # Piece 1 should contain a.txt and b.txt changes only (not c.txt)
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
+        $piece1Files | Should -Not -Contain 'c.txt'
+        $piece1Files | Should -Contain 'a.txt'
+        $piece1Files | Should -Contain 'b.txt'
+
+        # Piece 2 should contain c.txt changes only (not a.txt or b.txt)
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
+        $piece2Files | Should -Contain 'c.txt'
+        $piece2Files | Should -Not -Contain 'a.txt'
+        $piece2Files | Should -Not -Contain 'b.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "partitions files across two pieces by Path and PieceNumber" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit modifying a.txt and b.txt with distinct changes
+        @(
+          'a-line-1'
+          'a-line-2 (partition)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'b-line-1'
+          'b-line-2 (partition mode)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (partition)'
+        ) | Set-Content -Path 'b.txt'
+
+        git add a.txt b.txt | Out-Null
+        git commit -m 'Modify a.txt and b.txt for partition' | Out-Null
+
+        # Assign b.txt to piece 2, leave a.txt unassigned (default piece 1)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
+          ))
+
+        $created | Should -HaveCount 2
+
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
+        $piece1Files | Should -Contain 'a.txt'
+        $piece1Files | Should -Not -Contain 'b.txt'
+
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
+        $piece2Files | Should -Contain 'b.txt'
+        $piece2Files | Should -Not -Contain 'a.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "partitions multiple files across pieces by HunkId" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit modifying a.txt, b.txt, and adding c.txt and d.txt
+        @(
+          'a-line-1'
+          'a-line-2 (partition)'
+          'a-line-3'
+          'a-line-4 (new)'
+        ) | Set-Content -Path 'a.txt'
+
+        @(
+          'b-line-1'
+          'b-line-2 (partition mode)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (partition)'
+        ) | Set-Content -Path 'b.txt'
+
+        @(
+          'c-line-1'
+          'c-line-2'
+        ) | Set-Content -Path 'c.txt'
+
+        @(
+          'd-line-1'
+          'd-line-2'
+        ) | Set-Content -Path 'd.txt'
+
+        git add a.txt b.txt c.txt d.txt | Out-Null
+        git commit -m 'Modify a.txt, b.txt, add c.txt and d.txt' | Out-Null
+
+        $hunks = @(Get-GitSplitHunks -Ref 'HEAD')
+        $cHunk = @($hunks | Where-Object { $_.Path -eq 'c.txt' })
+        $dHunk = @($hunks | Where-Object { $_.Path -eq 'd.txt' })
+        $cHunk | Should -HaveCount 1
+        $dHunk | Should -HaveCount 1
+
+        # Assign c.txt to piece 2 and d.txt to piece 3; a.txt and b.txt default to piece 1
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $cHunk[0].HunkId; PieceNumber = 2 }
+            [pscustomobject]@{ HunkId = $dHunk[0].HunkId; PieceNumber = 3 }
+          ))
+
+        $created | Should -HaveCount 3
+
+        # Piece 1: a.txt and b.txt
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece1Files = @(git diff-tree --no-commit-id --name-only -r $created[0])
+        $piece1Files | Should -Contain 'a.txt'
+        $piece1Files | Should -Contain 'b.txt'
+        $piece1Files | Should -Not -Contain 'c.txt'
+        $piece1Files | Should -Not -Contain 'd.txt'
+
+        # Piece 2: c.txt only
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece2Files = @(git diff-tree --no-commit-id --name-only -r $created[1])
+        $piece2Files | Should -Contain 'c.txt'
+        $piece2Files | Should -Not -Contain 'a.txt'
+        $piece2Files | Should -Not -Contain 'b.txt'
+        $piece2Files | Should -Not -Contain 'd.txt'
+
+        # Piece 3: d.txt only
+        git checkout --detach -q $created[2] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+        $piece3Files = @(git diff-tree --no-commit-id --name-only -r $created[2])
+        $piece3Files | Should -Contain 'd.txt'
+        $piece3Files | Should -Not -Contain 'a.txt'
+        $piece3Files | Should -Not -Contain 'b.txt'
+        $piece3Files | Should -Not -Contain 'c.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
   Describe "New-Range" {
     It "resolves line/column to index and index to line/column consistently" {
       Push-Location $script:TempRepoPath

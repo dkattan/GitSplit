@@ -2621,6 +2621,19 @@ function Wait-GitSplitPullRequestChecks {
   return "$Repository#$PullRequest"
 }
 
+function New-PieceGroup {
+  [CmdletBinding()]
+  param(
+    [Parameter()]
+    [AllowEmptyCollection()]
+    [object[]]$Hunks = @()
+  )
+
+  [pscustomobject]@{
+    Hunks = [object[]]$Hunks
+  }
+}
+
 function New-SplitCommitPlan {
   [CmdletBinding()]
   param(
@@ -2802,17 +2815,17 @@ function New-SplitCommitPlan {
 
       $pieceGroups = @()
       for ($pieceIndex = 1; $pieceIndex -le $maxPiece; $pieceIndex++) {
-        $pieceGroups += ,@()
+        $pieceGroups += New-PieceGroup
       }
 
       for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
         $pieceNumber = if ($pieceByHunkIndex.ContainsKey($hunkIndex)) { [int]$pieceByHunkIndex[$hunkIndex] } else { 1 }
-        $pieceGroups[$pieceNumber - 1] = @($pieceGroups[$pieceNumber - 1] + $hunks[$hunkIndex])
+        $pieceGroups[$pieceNumber - 1] = New-PieceGroup -Hunks ($pieceGroups[$pieceNumber - 1].Hunks + $hunks[$hunkIndex])
       }
 
       $perFilePieces[$path] = [pscustomobject]@{
         StartPiece  = 1
-        PieceGroups = @($pieceGroups | ForEach-Object { [object[]]@($_) })
+        PieceGroups = [object[]]$pieceGroups
       }
       continue
     }
@@ -2853,9 +2866,9 @@ function New-SplitCommitPlan {
     }
 
     $startPiece = if ($uniquePieceNumbers.Count -gt 0) { [int]$uniquePieceNumbers[0] } else { 1 }
-    $pieceGroups = New-Object System.Collections.Generic.List[object]
+    $pieceGroups = @()
     if ($splitPoints.Count -eq 0) {
-      $pieceGroups.Add([object[]]@($hunks)) | Out-Null
+      $pieceGroups += New-PieceGroup -Hunks $hunks
     }
     else {
       $targetHunkIndex = $null
@@ -2918,13 +2931,13 @@ function New-SplitCommitPlan {
           $pieceHunks += @($hunks[($targetHunkIndex + 1)..($hunks.Count - 1)])
         }
 
-        $pieceGroups.Add([object[]]@($pieceHunks)) | Out-Null
+        $pieceGroups += New-PieceGroup -Hunks $pieceHunks
       }
     }
 
     $perFilePieces[$path] = [pscustomobject]@{
       StartPiece  = $startPiece
-      PieceGroups = $pieceGroups.ToArray()
+      PieceGroups = [object[]]$pieceGroups
     }
   }
 
@@ -2955,7 +2968,7 @@ function New-SplitCommitPlan {
         continue
       }
 
-      $pieceHunks = @($pieceGroups[$localPieceIndex])
+      $pieceHunks = @($pieceGroups[$localPieceIndex].Hunks)
 
       if ($pieceGroups.Count -eq 1 -and $pieceHunks.Count -eq $originalHunks.Count) {
         # Preserve whole-file assignments byte-for-byte so git apply sees the exact same
