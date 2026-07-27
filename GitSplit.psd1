@@ -20,6 +20,7 @@
     'Split-Commit'
     'New-Hunk'
     'New-Range'
+    'New-SplitCommitRange'
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
