@@ -26,8 +26,7 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
 
-          # Use Pester v5+ explicitly.
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion 6.0.0
 
       - name: Run tests
         shell: pwsh
