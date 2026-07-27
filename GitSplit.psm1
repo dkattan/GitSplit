@@ -2693,7 +2693,7 @@ function Wait-GitSplitPullRequestChecks {
   return "$Repository#$PullRequest"
 }
 
-function New-PieceGroup {
+function New-HunkGroup {
   [CmdletBinding()]
   param(
     [Parameter()]
@@ -2749,8 +2749,16 @@ function New-SplitCommitPlan {
 
   $hunkDescriptors = @(Get-GitSplitHunkDescriptors -Commit $target -FilePatches $filePatches)
   $hunkDescriptorById = @{}
+  $hunkMetadataByPath = @{}
   foreach ($hunkDescriptor in $hunkDescriptors) {
     $hunkDescriptorById[$hunkDescriptor.HunkId] = $hunkDescriptor
+    if (-not $hunkMetadataByPath.ContainsKey($hunkDescriptor.Path)) {
+      $hunkMetadataByPath[$hunkDescriptor.Path] = @()
+    }
+    $hunkMetadataByPath[$hunkDescriptor.Path] += [pscustomobject]@{
+      NewStart = $hunkDescriptor.NewStart
+      NewCount = $hunkDescriptor.NewCount
+    }
   }
 
   $rangesByPath = @{}
@@ -2874,17 +2882,17 @@ function New-SplitCommitPlan {
 
       $pieceGroups = @()
       for ($pieceIndex = 1; $pieceIndex -le $maxPiece; $pieceIndex++) {
-        $pieceGroups += New-PieceGroup
+        $pieceGroups += New-HunkGroup
       }
 
       for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
         $pieceNumber = if ($pieceByHunkIndex.ContainsKey($hunkIndex)) { [int]$pieceByHunkIndex[$hunkIndex] } else { 1 }
-        $pieceGroups[$pieceNumber - 1] = New-PieceGroup -Hunks ($pieceGroups[$pieceNumber - 1].Hunks + $hunks[$hunkIndex])
+        $pieceGroups[$pieceNumber - 1] = New-HunkGroup -Hunks ($pieceGroups[$pieceNumber - 1].Hunks + $hunks[$hunkIndex])
       }
 
       $perFilePieces[$path] = [pscustomobject]@{
         StartPiece  = 1
-        PieceGroups = [object[]]$pieceGroups
+        HunkGroups = [object[]]$pieceGroups
       }
       continue
     }
@@ -2927,16 +2935,19 @@ function New-SplitCommitPlan {
     $startPiece = if ($uniquePieceNumbers.Count -gt 0) { [int]$uniquePieceNumbers[0] } else { 1 }
     $pieceGroups = @()
     if ($splitPoints.Count -eq 0) {
-      $pieceGroups += New-PieceGroup -Hunks $hunks
+      $pieceGroups += New-HunkGroup -Hunks $hunks
     }
     else {
+      $pathHunkMetadata = @()
+      if ($hunkMetadataByPath.ContainsKey($path)) {
+        $pathHunkMetadata = $hunkMetadataByPath[$path]
+      }
+
       $targetHunkIndex = $null
       for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
-        $header = (($hunks[$hunkIndex] -split "`n", 2)[0]).Trim()
-        $null = $header -match '^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@'
-
-        $newStart = [int]$matches[3]
-        $newCount = if ($matches[4]) { [int]$matches[4] } else { 1 }
+        $metadata = $pathHunkMetadata[$hunkIndex]
+        $newStart = $metadata.NewStart
+        $newCount = $metadata.NewCount
         $newEndExclusive = $newStart + $newCount
 
         $matchingPoints = @($splitPoints | Where-Object {
@@ -2984,20 +2995,20 @@ function New-SplitCommitPlan {
           $pieceHunks += @($hunks[($targetHunkIndex + 1)..($hunks.Count - 1)])
         }
 
-        $pieceGroups += New-PieceGroup -Hunks $pieceHunks
+        $pieceGroups += New-HunkGroup -Hunks $pieceHunks
       }
     }
 
     $perFilePieces[$path] = [pscustomobject]@{
       StartPiece  = $startPiece
-      PieceGroups = [object[]]$pieceGroups
+      HunkGroups = [object[]]$pieceGroups
     }
   }
 
   $pieceCount = 1
   foreach ($path in $perFilePieces.Keys) {
     $filePlan = $perFilePieces[$path]
-    $pathPieceCount = $filePlan.StartPiece + @($filePlan.PieceGroups).Count - 1
+    $pathPieceCount = $filePlan.StartPiece + @($filePlan.HunkGroups).Count - 1
     if ($pathPieceCount -gt $pieceCount) {
       $pieceCount = $pathPieceCount
     }
@@ -3012,7 +3023,7 @@ function New-SplitCommitPlan {
       $section = Get-GitFileDiffSection -CombinedPatch $patchText -FilePath $path
 
       $filePlan = $perFilePieces[$path]
-      $pieceGroups = @($filePlan.PieceGroups)
+      $pieceGroups = @($filePlan.HunkGroups)
       $localPieceIndex = $i - $filePlan.StartPiece
       if ($localPieceIndex -lt 0 -or $localPieceIndex -ge $pieceGroups.Count) {
         continue
