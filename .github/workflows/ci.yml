@@ -16,6 +16,10 @@ jobs:
     # (We still run tests in the release/publish pipelines.)
     if: github.actor != 'github-actions[bot]'
 
+    permissions:
+      contents: read
+      code-quality: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,5 +43,18 @@ jobs:
           $config.Run.Exit = $true
           $config.TestResult.Enabled = $true
           $config.Output.Verbosity = 'Detailed'
+          $config.CodeCoverage.Enabled = $true
+          $config.CodeCoverage.Path = './GitSplit.psm1'
+          $config.CodeCoverage.OutputFormat = 'Cobertura'
+          $config.CodeCoverage.OutputPath = './coverage.cobertura.xml'
 
           Invoke-Pester -Configuration $config
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: coverage.cobertura.xml
+          language: PowerShell
+          label: code-coverage/pester
+          fail-on-error: false
