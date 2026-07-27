@@ -357,7 +357,15 @@ function Test-GitRefExists {
     return $true
   }
 
-  return $false
+  if ($query.ExitCode -eq 1) {
+    return $false
+  }
+
+  if ([string]::IsNullOrWhiteSpace($query.Output)) {
+    throw "Failed to inspect git ref '$Ref'."
+  }
+
+  throw "Failed to inspect git ref '$Ref'.`n$($query.Output)"
 }
 
 function Get-MoveCommitMissingDestinationBranchMessage {
