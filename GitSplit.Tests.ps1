@@ -1891,6 +1891,36 @@ Import-Module '$escapedManifestPath' -Force
       }
     }
 
+    It "Test-GitRefExists returns true for an existing ref and false for a missing ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        Test-GitRefExists -Ref 'refs/heads/main' | Should -Be $true
+        Test-GitRefExists -Ref 'refs/heads/does-not-exist' | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "Test-GitRefExists throws on operational failures instead of silently returning false" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Point GIT_DIR at a non-existent repository so `git show-ref` fails with
+        # exit code 128 (a fatal/operational error) rather than 1 (ref not found).
+        $oldGitDir = $env:GIT_DIR
+        $env:GIT_DIR = Join-Path $script:TempRepoPath 'nonexistent-git-dir'
+        try {
+          { Test-GitRefExists -Ref 'refs/heads/main' } | Should -Throw
+        }
+        finally {
+          $env:GIT_DIR = $oldGitDir
+        }
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
     It "cherry-picks HEAD to another branch without switching the current branch" {
       Push-Location $script:TempRepoPath
       try {
