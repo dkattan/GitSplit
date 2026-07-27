@@ -1,5 +1,6 @@
 # PowerShell / Pester
 /testResults.xml
+/coverage.xml
 
 # Test artifacts
 /temprepo/
