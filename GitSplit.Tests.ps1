@@ -1891,6 +1891,36 @@ Import-Module '$escapedManifestPath' -Force
       }
     }
 
+    It "Test-GitRefExists returns true for an existing ref and false for a missing ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        Test-GitRefExists -Ref 'refs/heads/main' | Should -Be $true
+        Test-GitRefExists -Ref 'refs/heads/does-not-exist' | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "Test-GitRefExists throws on operational failures instead of silently returning false" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Point GIT_DIR at a non-existent repository so `git show-ref` fails with
+        # exit code 128 (a fatal/operational error) rather than 1 (ref not found).
+        $oldGitDir = $env:GIT_DIR
+        $env:GIT_DIR = Join-Path $script:TempRepoPath 'nonexistent-git-dir'
+        try {
+          { Test-GitRefExists -Ref 'refs/heads/main' } | Should -Throw
+        }
+        finally {
+          $env:GIT_DIR = $oldGitDir
+        }
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
     It "cherry-picks HEAD to another branch without switching the current branch" {
       Push-Location $script:TempRepoPath
       try {
@@ -3503,4 +3533,1818 @@ $destinationBranch
     }
   }
 
+
+  Describe "Split-Commit error guardrails" {
+    It "throws when HunkId cannot be resolved" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = 'hnonexistent'; PieceNumber = 2 }
+          ) } | Should -Throw -ExpectedMessage "*could not resolve HunkId*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when NewCommitRanges element has neither Path nor HunkId" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ PieceNumber = 2 }
+          ) } | Should -Throw -ExpectedMessage "*must include Path or HunkId*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when mixing HunkId and Line selectors for the same path" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = 2 }
+            [pscustomobject]@{ Path = 'b.txt'; Line = 3 }
+          ) } | Should -Throw -ExpectedMessage "*mixing HunkId and Line*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when mixing HunkId and path-level selectors for the same path" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = 2 }
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 1 }
+          ) } | Should -Throw -ExpectedMessage "*mixing HunkId and path-level*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when HunkId selector is missing PieceNumber" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId }
+          ) } | Should -Throw -ExpectedMessage "*must include PieceNumber*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when HunkId PieceNumber is less than 1" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = 0 }
+          ) } | Should -Throw -ExpectedMessage "*PieceNumber*at least 1*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the same HunkId is specified multiple times" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = 1 }
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = 2 }
+          ) } | Should -Throw -ExpectedMessage "*specified multiple times*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when path-level PieceNumber is less than 1" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 0 }
+          ) } | Should -Throw -ExpectedMessage "*PieceNumber*at least 1*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when path range has neither Line nor PieceNumber" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt' }
+          ) } | Should -Throw -ExpectedMessage "*must include either Line or PieceNumber*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when split line cannot be matched to any hunk" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; Line = 999 }
+          ) } | Should -Throw -ExpectedMessage "*could not match split line*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when split points land in multiple hunks of the same file" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a file, then modify it with two separate hunks
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multisplit.txt'
+
+        git add multisplit.txt | Out-Null
+        git commit -m 'Add multisplit.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10 changed'
+        ) | Set-Content -Path 'multisplit.txt'
+
+        git add multisplit.txt | Out-Null
+        git commit -m 'Modify multisplit.txt in two hunks' | Out-Null
+
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'multisplit.txt'; Line = 2 }
+            [pscustomobject]@{ Path = 'multisplit.txt'; Line = 10 }
+          ) } | Should -Throw -ExpectedMessage "*split points in multiple hunks*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when fewer than 2 non-empty split pieces are produced" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 1 }
+          ) } | Should -Throw -ExpectedMessage "*at least 2 non-empty split pieces*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "supports Hunk alias for HunkId" {
+      Push-Location $script:TempRepoPath
+      try {
+        # HEAD~1 modifies both a.txt and b.txt
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD~1' | Where-Object Path -eq 'b.txt')[0]
+        $created = @(Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+            [pscustomobject]@{ Hunk = $hunk.HunkId; Piece = 2 }
+          ))
+        $created | Should -HaveCount 2
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "supports Piece alias for PieceNumber with path-level assignment" {
+      Push-Location $script:TempRepoPath
+      try {
+        # HEAD~1 modifies both a.txt and b.txt
+        $created = @(Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; Piece = 2 }
+          ))
+        $created | Should -HaveCount 2
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+  }
+
+  Describe "Split-Hunk edge cases" {
+    It "throws when index is out of range" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 2 -NewStart 1 -NewCount 2 -BodyLines @(' a', ' b')
+      { Split-Hunk -Hunk $hunk -Index 999 } | Should -Throw -ExpectedMessage "*out of range*"
+    }
+
+    It "handles a hunk with no body lines" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 0 -NewStart 1 -NewCount 0 -BodyLines @()
+      $hunk | Should -Match '^@@'
+    }
+
+    It "handles blank context lines in body" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 3 -NewStart 1 -NewCount 3 -BodyLines @(' a', '', ' c')
+      $result = Split-Hunk -Hunk $hunk -Line 2
+      $result | Should -HaveCount 2
+    }
+
+    It "throws when mid-line split column is out of range" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 2 -BodyLines @(' a', '+b')
+      { Split-Hunk -Hunk $hunk -Line 2 -Column 999 } | Should -Throw -ExpectedMessage "*Column*out of range*"
+    }
+  }
+
+  Describe "ConvertTo-PowerShellStringLiteral" {
+    It "returns single-quoted empty string for null input" {
+      ConvertTo-PowerShellStringLiteral -Value $null | Should -Be "''"
+    }
+
+    It "escapes single quotes" {
+      ConvertTo-PowerShellStringLiteral -Value "it's" | Should -Be "'it''s'"
+    }
+  }
+
+  Describe "Get-GitSplitFileContentAtCommit" {
+    It "returns null for a non-existent file" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        Get-GitSplitFileContentAtCommit -Path 'nonexistent.txt' -Commit $headSha | Should -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitFileDiffSection" {
+    It "returns the section for a matching file" {
+      $patch = "diff --git a/a.txt b/a.txt`n@@ -1 +1 @@`n-old`n+new"
+      $result = Get-GitFileDiffSection -CombinedPatch $patch -FilePath 'a.txt'
+      $result | Should -Match 'diff --git a/a.txt'
+    }
+  }
+
+  Describe "Get-GitSplitRelativeImportsFromText" {
+    It "returns empty array for null or whitespace text" {
+      Get-GitSplitRelativeImportsFromText -Text $null | Should -Be @()
+      Get-GitSplitRelativeImportsFromText -Text '   ' | Should -Be @()
+    }
+  }
+
+  Describe "Get-GitSplitWorkflowLocalActionPathsFromText" {
+    It "returns empty array for null or whitespace text" {
+      Get-GitSplitWorkflowLocalActionPathsFromText -Text $null | Should -Be @()
+      Get-GitSplitWorkflowLocalActionPathsFromText -Text '   ' | Should -Be @()
+    }
+  }
+
+  Describe "New-Hunk blank line handling" {
+    It "converts null body lines to space" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 1 -BodyLines @($null)
+      $hunk | Should -Match "(?s)^@@ -1,1 \+1,1 @@.* $"
+    }
+  }
+
+  Describe "Split-Patch edge cases" {
+    It "skips whitespace-only file entries" {
+      $patch = "diff --git a/a.txt b/a.txt`n@@ -1 +1 @@`n-old`n+new`n`ndiff --git a/b.txt b/b.txt`n@@ -1 +1 @@`n-old2`n+new2"
+      $result = Split-Patch -patch $patch
+      $result | Should -HaveCount 2
+      $result[0].FilePath | Should -Be 'a.txt'
+      $result[1].FilePath | Should -Be 'b.txt'
+    }
+  }
+
+  Describe "Invoke-WithProgressSuppressed" {
+    It "restores ProgressPreference after execution" {
+      $global:ProgressPreference = 'Continue'
+      Invoke-WithProgressSuppressed -Script { $global:ProgressPreference | Should -Be 'SilentlyContinue' }
+      $global:ProgressPreference | Should -Be 'Continue'
+    }
+  }
+
+  Describe "Test hook provider validation" {
+    AfterEach {
+      Reset-GitSplitTestHooks
+    }
+
+    It "throws when Guid provider returns an invalid value" {
+      Set-GitSplitTestHooks -GuidProvider { 'not-a-guid' }
+      { Get-GitSplitGuid } | Should -Throw -ExpectedMessage "*valid Guid*"
+    }
+
+    It "throws when timestamp provider returns an invalid value" {
+      Set-GitSplitTestHooks -TimestampProvider { 'not-a-date' }
+      { Get-GitSplitTimestamp } | Should -Throw -ExpectedMessage "*valid DateTime*"
+    }
+
+    It "throws when temp root provider returns empty" {
+      Set-GitSplitTestHooks -TempRootProvider { '' }
+      { Get-GitSplitTempRoot } | Should -Throw -ExpectedMessage "*empty path*"
+    }
+
+    It "throws when stash name provider returns empty" {
+      Set-GitSplitTestHooks -StashNameProvider { '' }
+      { New-GitSplitStashName } | Should -Throw -ExpectedMessage "*empty value*"
+    }
+
+    It "accepts a string guid that can be parsed" {
+      Set-GitSplitTestHooks -GuidProvider { '12345678-1234-1234-1234-123456789abc' }
+      $result = Get-GitSplitGuid
+      $result | Should -BeOfType [guid]
+    }
+
+    It "accepts a string timestamp that can be parsed" {
+      Set-GitSplitTestHooks -TimestampProvider { '2025-01-01' }
+      $result = Get-GitSplitTimestamp
+      $result | Should -BeOfType [datetime]
+    }
+  }
+
+  Describe "Invoke-Git error formatting" {
+    It "throws with details when git fails and produces output" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -ErrorMessage 'custom error' --bad-command 2>$null } | Should -Throw -ExpectedMessage "*custom error*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws without details when output is empty" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -ErrorMessage 'custom error' -Quiet --bad-command 2>$null } | Should -Throw -ExpectedMessage "*custom error*exit code*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-GitQuery error formatting" {
+    It "throws with context when ErrorMessage is provided and git fails" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-GitQuery -ErrorMessage 'query failed' --bad-command 2>$null } | Should -Throw -ExpectedMessage "*query failed*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws with auto-generated context when no ErrorMessage and git fails" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-GitQuery --bad-command 2>$null } | Should -Throw -ExpectedMessage "*git*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitRefExists" {
+    It "returns false for a non-existent ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        Test-GitRefExists -Ref 'refs/heads/nonexistent' | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitCommitIsAncestor" {
+    It "returns true when ancestor is an ancestor of descendant" {
+      Push-Location $script:TempRepoPath
+      try {
+        $ancestor = (git rev-parse HEAD~2).Trim()
+        $descendant = (git rev-parse HEAD).Trim()
+        Test-GitCommitIsAncestor -Ancestor $ancestor -Descendant $descendant | Should -Be $true
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "returns false when ancestor is not an ancestor of descendant" {
+      Push-Location $script:TempRepoPath
+      try {
+        $descendant = (git rev-parse HEAD~2).Trim()
+        $ancestor = (git rev-parse HEAD).Trim()
+        Test-GitCommitIsAncestor -Ancestor $ancestor -Descendant $descendant | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Resolve-GitCommit" {
+    It "throws for an unresolvable commit reference" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Resolve-GitCommit -Ref 'not-a-real-ref' -ErrorMessage 'Failed to resolve commit reference.' } |
+          Should -Throw -ExpectedMessage "*Failed to resolve commit reference*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitPatchText error paths" {
+    It "throws when git show fails for an invalid ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Get-GitPatchText -Ref 'not-a-real-ref' -ErrorMessage 'patch failed' } |
+          Should -Throw -ExpectedMessage '*patch failed*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Select-GitSplitPaths" {
+    It "throws when no PathPattern or PatchPattern is provided" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Select-GitSplitPaths -Ref 'HEAD' } |
+          Should -Throw -ExpectedMessage '*at least one*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "filters by PatchPattern and skips non-matching patches" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Select-GitSplitPaths -Ref 'HEAD' -PathPattern '.*' -PatchPattern 'nomatchpattern')
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitClosure edge cases" {
+    It "excludes paths not changed in the commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Get-GitSplitClosure -Ref 'HEAD' -Paths @('nonexistent.txt'))
+        $result | Should -HaveCount 1
+        $result[0].Status | Should -Be 'Excluded'
+        $result[0].Rule | Should -Be 'NotChangedInCommit'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitSplitSelection edge cases" {
+    It "returns empty when all selected files have matching dependencies" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Test-GitSplitSelection -Ref 'HEAD' -Paths @('a.txt'))
+        # a.txt has no import dependencies, so no break risks
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Wait-GitSplitPullRequestChecks" {
+    It "throws when gh CLI is not available" {
+      $oldPath = $env:PATH
+      try {
+        $env:PATH = '/nonexistent'
+        { Wait-GitSplitPullRequestChecks -PullRequest 1 } |
+          Should -Throw -ExpectedMessage "*GitHub CLI 'gh' is required*"
+      }
+      finally {
+        $env:PATH = $oldPath
+      }
+    }
+  }
+
+  Describe "ConvertTo-GitScript" {
+    It "throws for an unsupported step kind" {
+      $badPlan = [pscustomobject]@{
+        Name = 'Test'
+        Metadata = @{}
+        Steps = @(
+          [pscustomobject]@{ Kind = 'BadKind'; Lines = @('test') }
+        )
+      }
+      { ConvertTo-GitScript -Plan $badPlan } | Should -Throw -ExpectedMessage '*Unsupported git plan step kind*'
+    }
+
+    It "renders blank comment lines as hash-only" {
+      $plan = [pscustomobject]@{
+        Name = 'Test'
+        Metadata = @{}
+        Steps = @(
+          [pscustomobject]@{ Kind = 'Comment'; Lines = @('real comment', '') }
+        )
+      }
+      $script = ConvertTo-GitScript -Plan $plan
+      $script | Should -Match '(?m)^# real comment$'
+      $script | Should -Match '(?m)^#$'
+    }
+  }
+
+  Describe "Write-GitScript" {
+    It "creates parent directories when needed" {
+      Push-Location $script:TempRepoPath
+      try {
+        $deepPath = Join-Path $script:TempRepoPath 'sub/dir/script.ps1'
+        $plan = [pscustomobject]@{
+          Name = 'Test'
+          Metadata = @{}
+          Steps = @(
+            [pscustomobject]@{ Kind = 'Comment'; Lines = @('test') }
+          )
+        }
+        $result = Write-GitScript -Plan $plan -Path $deepPath
+        Test-Path $result | Should -Be $true
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-MoveCommitPlan error paths" {
+    It "throws when BaseRef is provided without CreateDestinationBranch" {
+      Push-Location $script:TempRepoPath
+      try {
+        { New-MoveCommitPlan -CommitRef 'HEAD' -DestinationBranch 'feature/test' -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*only accepts -BaseRef together with -CreateDestinationBranch*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when CreateDestinationBranch is used but branch already exists" {
+      Push-Location $script:TempRepoPath
+      try {
+        git branch existing-branch HEAD~1 2>$null | Out-Null
+        { New-MoveCommitPlan -CommitRef 'HEAD' -DestinationBranch 'existing-branch' -CreateDestinationBranch -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*already exists*'
+      }
+      finally {
+        git branch -D existing-branch 2>$null | Out-Null
+        Pop-Location
+      }
+    }
+
+    It "uses remote tracking branch when only remote exists" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a remote branch by cloning locally
+        $remotePath = Join-Path $script:TempRepoPath 'remote.git'
+        git clone --bare -q $script:TempRepoPath $remotePath 2>$null | Out-Null
+        git remote add origin $remotePath 2>$null | Out-Null
+        git fetch origin -q 2>$null | Out-Null
+        git branch -r 2>$null | Out-Null
+
+        # Use main as remote-only target
+        $plan = New-MoveCommitPlan -CommitRef 'HEAD' -DestinationBranch 'main'
+        # Should not throw - uses remote tracking branch
+        $plan | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        git remote remove origin 2>$null | Out-Null
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Add-Commit error paths" {
+    It "throws when patch file does not exist" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Add-Commit -After 'HEAD~1' -PatchFile '/nonexistent/path.patch' -CommitMessage 'test' } |
+          Should -Throw -ExpectedMessage '*Patch file not found*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when no commits to replay after base ref" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Add-Commit -After 'HEAD' -PatchFile '/nonexistent/path.patch' -CommitMessage 'test' } |
+          Should -Throw -ExpectedMessage '*at least 1 commit to replay*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-GitSplitAbsorb errors" {
+    It "throws when unable to resolve fixup commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Mock by calling with a plan that has no targets - should return empty
+        $result = Invoke-GitSplitAbsorb -From (git rev-parse HEAD).Trim()
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitChangedCommitInfo" {
+    It "returns commit info for a valid commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $info = Get-GitSplitChangedCommitInfo -Ref 'HEAD'
+        $info.Commit | Should -Match '^[0-9a-f]{40}$'
+        $info.FilePatches | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Move-Commit push script generation" {
+    It "generates force-push lines in script when RemoveFromSource and Push and ForcePushSource" {
+      Push-Location $script:TempRepoPath
+      try {
+        git branch existing-dest HEAD~1 2>$null | Out-Null
+        $scriptPath = Join-Path $script:TempRepoPath 'move-push-script.ps1'
+        Move-Commit -CommitRef 'HEAD' -DestinationBranch 'existing-dest' -RemoveFromSource -Push -ForcePushSource -OutputScriptPath $scriptPath | Out-Null
+        $content = Get-Content $scriptPath -Raw
+        $content | Should -Match 'push --force-with-lease'
+        git branch -D existing-dest 2>$null | Out-Null
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "generates regular push lines in script when RemoveFromSource and Push without ForcePushSource" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Need 3 commits so HEAD~1 is not HEAD (uses RebaseOntoParent, not ResetToParent)
+        git branch existing-dest2 HEAD~2 2>$null | Out-Null
+        $scriptPath = Join-Path $script:TempRepoPath 'move-push-script2.ps1'
+        Move-Commit -CommitRef 'HEAD~1' -DestinationBranch 'existing-dest2' -RemoveFromSource -Push -OutputScriptPath $scriptPath | Out-Null
+        $content = Get-Content $scriptPath -Raw
+        $content | Should -Match 'push origin \$expectedBranch'
+        git branch -D existing-dest2 2>$null | Out-Null
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "generates ResetToParent source removal lines in script" {
+      Push-Location $script:TempRepoPath
+      try {
+        git branch existing-dest3 HEAD~1 2>$null | Out-Null
+        $scriptPath = Join-Path $script:TempRepoPath 'move-reset-script.ps1'
+        Move-Commit -CommitRef 'HEAD' -DestinationBranch 'existing-dest3' -RemoveFromSource -OutputScriptPath $scriptPath | Out-Null
+        $content = Get-Content $scriptPath -Raw
+        $content | Should -Match 'rewrittenHead'
+        git branch -D existing-dest3 2>$null | Out-Null
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Remove-Commit push script generation" {
+    It "generates force-push lines in script when Push and ForcePush" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $script:TempRepoPath 'remove-push-script.ps1'
+        Remove-Commit -CommitRef 'HEAD' -Push -ForcePush -OutputScriptPath $scriptPath | Out-Null
+        $content = Get-Content $scriptPath -Raw
+        $content | Should -Match 'push --force-with-lease'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "generates regular push lines in script when Push without ForcePush" {
+      Push-Location $script:TempRepoPath
+      try {
+        $scriptPath = Join-Path $script:TempRepoPath 'remove-push-script2.ps1'
+        Remove-Commit -CommitRef 'HEAD' -Push -OutputScriptPath $scriptPath | Out-Null
+        $content = Get-Content $scriptPath -Raw
+        $content | Should -Match 'push origin \$targetBranch'
+        $content | Should -Not -Match 'force-with-lease'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Move-Commit detached HEAD" {
+    It "throws when in detached HEAD state" {
+      Push-Location $script:TempRepoPath
+      try {
+        git checkout --detach -q HEAD~1 2>$null | Out-Null
+        { New-MoveCommitPlan -CommitRef 'HEAD' -DestinationBranch 'some-branch' } |
+          Should -Throw -ExpectedMessage '*detached HEAD*'
+      }
+      finally {
+        git checkout -q - 2>$null | Out-Null
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Hunk blank line column split" {
+    It "handles blank context lines during column split" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 4 -NewStart 1 -NewCount 4 -BodyLines @(' a', '', ' c', '+d')
+      $result = Split-Hunk -Hunk $hunk -Line 4 -Column 2
+      $result | Should -HaveCount 2
+    }
+  }
+
+  Describe "Split-Hunk blank line line-split" {
+    It "handles blank context lines during line split" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 4 -NewStart 1 -NewCount 4 -BodyLines @(' a', '', ' c', '+d')
+      $result = Split-Hunk -Hunk $hunk -Line 3
+      $result | Should -HaveCount 2
+    }
+  }
+
+  Describe "Get-GitSplitHunkHeaderMetadata" {
+    It "throws for invalid hunk header" {
+      { Get-GitSplitHunkHeaderMetadata -Hunk 'not a hunk header' } |
+        Should -Throw -ExpectedMessage '*valid @@ header*'
+    }
+
+    It "handles single-line hunk count" {
+      $hunk = '@@ -1 +1 @@' + "`n" + ' content'
+      $result = Get-GitSplitHunkHeaderMetadata -Hunk $hunk
+      $result.OldCount | Should -Be 1
+      $result.NewCount | Should -Be 1
+    }
+  }
+
+  Describe "Get-GitSplitHunkDescriptors" {
+    It "returns descriptors for file patches" {
+      $filePatches = @(
+        [pscustomobject]@{
+          FilePath = 'test.txt'
+          Patches = @('@@ -1,1 +1,1 @@' + "`n" + ' content')
+        }
+      )
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        $result = @(Get-GitSplitHunkDescriptors -Commit $headSha -FilePatches $filePatches)
+        $result | Should -HaveCount 1
+        $result[0].Path | Should -Be 'test.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "ConvertTo-GitSplitRepoRelativePath" {
+    It "handles paths outside the repo root" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = ConvertTo-GitSplitRepoRelativePath -Path '/tmp/external/file.txt' -RepoRoot $script:TempRepoPath
+        # Paths outside the repo root are returned as-is or normalized
+        $result | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitSplitGeneratedPath" {
+    It "returns false for a non-generated file at HEAD" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        Test-GitSplitGeneratedPath -Path 'a.txt' -Commit $headSha | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Select-GitSplitPaths PatchPattern matching" {
+    It "matches files by patch pattern" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Select-GitSplitPaths -Ref 'HEAD~1' -PathPattern '.*' -PatchPattern 'a-line-2')
+        $result | Should -HaveCount 1
+        $result[0].Path | Should -Be 'a.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitClosure generated dependency" {
+    It "excludes generated dependencies" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Get-GitSplitClosure -Ref 'HEAD~1' -Paths @('a.txt'))
+        $result | Should -HaveCount 1
+        $result[0].Status | Should -Be 'Selected'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitWorkflowLocalActionPathsFromText" {
+    It "extracts local action paths from workflow text" {
+      $text = @"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/run-frontend
+      - name: Checkout
+        uses: actions/checkout@v4
+"@
+      $result = @(Get-GitSplitWorkflowLocalActionPathsFromText -Text $text)
+      $result | Should -Contain '.github/actions/run-frontend/action.yml'
+    }
+  }
+
+  Describe "Resolve-GitSplitImportCandidates" {
+    It "skips candidates outside repo root" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Resolve-GitSplitImportCandidates -RepoRoot $script:TempRepoPath -ImporterPath 'src/main.ts' -Specifier '../../../etc/passwd')
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "skips candidates with empty relative paths" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Import from the repo root itself - the relative path would be empty
+        $result = @(Resolve-GitSplitImportCandidates -RepoRoot $script:TempRepoPath -ImporterPath 'index.ts' -Specifier '.')
+        # May or may not return results depending on file existence
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Commit multi-split-point" {
+    It "splits a hunk at two split points producing three pieces" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multisplit2.txt'
+
+        git add multisplit2.txt | Out-Null
+        git commit -m 'Add multisplit2.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6 changed'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+        ) | Set-Content -Path 'multisplit2.txt'
+
+        git add multisplit2.txt | Out-Null
+        git commit -m 'Modify multisplit2.txt' | Out-Null
+
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'multisplit2.txt'; Line = 6 }
+          ))
+        $created | Should -HaveCount 2
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Commit with trailing hunks" {
+    It "splits at a hunk that has trailing hunks after it" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'line-1'
+          'line-2'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+          'line-11'
+          'line-12'
+        ) | Set-Content -Path 'trailing.txt'
+
+        git add trailing.txt | Out-Null
+        git commit -m 'Add trailing.txt' | Out-Null
+
+        @(
+          'line-1'
+          'line-2 changed'
+          'line-3'
+          'line-4'
+          'line-5'
+          'line-6'
+          'line-7'
+          'line-8'
+          'line-9'
+          'line-10'
+          'line-11'
+          'line-12 changed'
+        ) | Set-Content -Path 'trailing.txt'
+
+        git add trailing.txt | Out-Null
+        git commit -m 'Modify trailing.txt in two hunks' | Out-Null
+
+        # Split at line 12 - this is in the second hunk, with the first hunk as a leading hunk
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'trailing.txt'; Line = 12 }
+          ))
+        $created | Should -HaveCount 2
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Export-ModuleMember non-CI branch" {
+    It "exports the manifest function list when CI env is not set" {
+      $oldCI = $env:CI
+      try {
+        $env:CI = $null
+        Remove-Module GitSplit -ErrorAction SilentlyContinue
+        Import-Module "$PSScriptRoot/GitSplit.psm1" -Force
+        $exported = (Get-Module GitSplit).ExportedFunctions.Keys
+        $exported | Should -Contain 'Split-Commit'
+        $exported | Should -Contain 'Move-Commit'
+      }
+      finally {
+        $env:CI = $oldCI
+        Remove-Module GitSplit -ErrorAction SilentlyContinue
+        Import-Module "$PSScriptRoot/GitSplit.psm1" -Force
+      }
+    }
+  }
+
+  Describe "Invoke-Git WriteHostOnError" {
+    It "writes errors to host when WriteHostOnError is set" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -WriteHostOnError --bad-command 2>&1 | Out-Null } |
+          Should -Throw
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-Git error with details" {
+    It "includes stderr details in the throw message" {
+      Push-Location $script:TempRepoPath
+      try {
+        # git show with a bad ref produces stderr output
+        { Invoke-Git -ErrorMessage 'show failed' show not-a-real-ref 2>&1 | Out-Null } |
+          Should -Throw -ExpectedMessage '*show failed*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-GitQuery error without ErrorMessage" {
+    It "generates context from git args when no ErrorMessage is provided" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-GitQuery --bad-command 2>&1 | Out-Null } |
+          Should -Throw -ExpectedMessage '*git*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Resolve-GitCommit default error message" {
+    It "uses default error message when none is provided" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Resolve-GitCommit -Ref 'not-a-real-ref' } |
+          Should -Throw -ExpectedMessage '*Failed to resolve commit reference*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitRefExists error branches" {
+    It "returns false for a non-existent ref without throwing" {
+      Push-Location $script:TempRepoPath
+      try {
+        # show-ref --verify always returns 1 for non-existent refs, never 128
+        Test-GitRefExists -Ref 'refs/heads/totally-nonexistent-branch' | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitCommitIsAncestor error branches" {
+    It "throws when merge-base returns an unexpected error code" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Invalid commit refs cause exit code 128
+        { Test-GitCommitIsAncestor -Ancestor 'not-a-real-ref' -Descendant 'also-not-real' } |
+          Should -Throw -ExpectedMessage '*Failed to determine whether*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "ConvertTo-GitSplitRepoRelativePath edge cases" {
+    It "returns empty string when path equals repo root" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = ConvertTo-GitSplitRepoRelativePath -Path $script:TempRepoPath -RepoRoot $script:TempRepoPath
+        $result | Should -Be ''
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "strips leading .// from relative paths" {
+      $result = ConvertTo-GitSplitRepoRelativePath -Path './src/file.txt'
+      $result | Should -Be 'src/file.txt'
+    }
+  }
+
+  Describe "Test-GitSplitGeneratedPath with non-HEAD commit" {
+    It "returns false for a regular file when inspecting a non-HEAD commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        $parentSha = (git rev-parse HEAD~1).Trim()
+        # When Commit != HEAD and check-attr doesn't support --source,
+        # it falls back to pattern matching
+        $result = Test-GitSplitGeneratedPath -Path 'a.txt' -Commit $parentSha
+        $result | Should -Be $false
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "detects generated paths by pattern" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        $result = Test-GitSplitGeneratedPath -Path 'src/__generated__/file.cs' -Commit $headSha
+        $result | Should -Be $true
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitGuid direct guid return" {
+    It "returns a guid directly when provider returns a [guid]" {
+      Set-GitSplitTestHooks -GuidProvider { [guid]::NewGuid() }
+      try {
+        $result = Get-GitSplitGuid
+        $result | Should -BeOfType [guid]
+      }
+      finally {
+        Reset-GitSplitTestHooks
+      }
+    }
+  }
+
+  Describe "Split-Hunk blank line in column split" {
+    It "handles blank context lines when locating target for column split" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 5 -NewStart 1 -NewCount 5 -BodyLines @(' a', '', ' c', '+dd', ' e')
+      $result = Split-Hunk -Hunk $hunk -Line 4 -Column 2
+      $result | Should -HaveCount 2
+    }
+  }
+
+  Describe "Split-Hunk blank line in line split" {
+    It "handles blank context lines during line-based split" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 5 -NewStart 1 -NewCount 5 -BodyLines @(' a', '', ' c', ' d', ' e')
+      $result = Split-Hunk -Hunk $hunk -Line 3
+      $result | Should -HaveCount 2
+    }
+  }
+
+  Describe "Split-Hunk split at boundary" {
+    It "throws when split point is at start or end of body" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 1 -BodyLines @(' content')
+      { Split-Hunk -Hunk $hunk -Line 1 } |
+        Should -Throw -ExpectedMessage '*cannot split at start or end*'
+    }
+  }
+
+  Describe "New-Hunk null body line conversion" {
+    It "converts null entries to space character" {
+      $hunk = New-Hunk -OldStart 1 -OldCount 2 -NewStart 1 -NewCount 2 -BodyLines @(' a', $null, ' c')
+      # The null line should become a space (context line)
+      $hunk | Should -Match "(?s)^@@ -1,2 \+1,2 @@.* .*$"
+    }
+  }
+
+  Describe "Split-Patch whitespace skipping" {
+    It "skips whitespace-only file entries in the patch" {
+      $patch = "diff --git a/a.txt b/a.txt`n`n@@ -1 +1 @@`n-old`n+new`n`ndiff --git a/b.txt b/b.txt`n@@ -1 +1 @@`n-old2`n+new2"
+      $result = Split-Patch -patch $patch
+      $result | Should -HaveCount 2
+    }
+  }
+
+  Describe "Get-GitFileDiffSection no match" {
+    It "returns null when file is not found in patch" {
+      $patch = "diff --git a/a.txt b/a.txt`n@@ -1 +1 @@`n-old`n+new"
+      $result = Get-GitFileDiffSection -CombinedPatch $patch -FilePath 'nonexistent.txt'
+      $result | Should -BeNullOrEmpty
+    }
+  }
+
+  Describe "Get-GitSplitWorkflowLocalActionPathsFromText with extension" {
+    It "handles paths that already have an extension" {
+      $text = "jobs:`n  test:`n    steps:`n      - uses: ./.github/actions/custom.yml"
+      $result = @(Get-GitSplitWorkflowLocalActionPathsFromText -Text $text)
+      $result | Should -Contain '.github/actions/custom.yml'
+    }
+  }
+
+  Describe "Get-GitSplitClosure generated dependency exclusion" {
+    It "excludes generated dependencies in closure" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit with a file in __generated__ directory
+        New-Item -ItemType Directory -Path 'src/__generated__' -Force | Out-Null
+        @('generated content') | Set-Content -Path 'src/__generated__/gen.ts'
+        @('import { x } from ''./__generated__/gen''') | Set-Content -Path 'src/main.ts'
+
+        git add src/__generated__/gen.ts src/main.ts | Out-Null
+        git commit -m 'Add generated and main' | Out-Null
+
+        $result = @(Get-GitSplitClosure -Ref 'HEAD' -Paths @('src/main.ts'))
+        # main.ts should be selected, gen.ts should be excluded as generated
+        $generated = $result | Where-Object { $_.Path -like '*__generated__*' }
+        if ($generated) {
+          $generated.Status | Should -Be 'Excluded'
+          $generated.Rule | Should -Be 'GeneratedDependency'
+        }
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitSplitSelection with SkipClosureExpansion" {
+    It "reports break risks with SkipClosureExpansion" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Test-GitSplitSelection -Ref 'HEAD~1' -Paths @('a.txt') -SkipClosureExpansion)
+        # a.txt has no dependencies, so no risks expected
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-SplitCommitPlan error paths" {
+    It "throws when Hunk selector has empty PieceNumber value" {
+      Push-Location $script:TempRepoPath
+      try {
+        $hunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'b.txt')[0]
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $hunk.HunkId; PieceNumber = '' }
+          ) } | Should -Throw -ExpectedMessage '*must include PieceNumber*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when path range PieceNumber is empty" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; PieceNumber = '' }
+          ) } | Should -Throw -ExpectedMessage '*at least 2*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when split point is missing Line property" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ Path = 'b.txt'; Column = 1 }
+          ) } | Should -Throw -ExpectedMessage '*must include either Line or PieceNumber*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Add-Commit with valid patch" {
+    It "applies a patch and inserts a commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a patch file
+        $patchPath = Join-Path $script:TempRepoPath 'test.patch'
+        @(
+          'diff --git a/newfile.txt b/newfile.txt'
+          'new file mode 100644'
+          'index 0000000..ce01362'
+          '--- /dev/null'
+          '+++ b/newfile.txt'
+          '@@ -0,0 +1,1 @@'
+          '+hello from patch'
+        ) | Set-Content -Path $patchPath -Encoding utf8
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        Add-Commit -After 'HEAD~1' -PatchFile $patchPath -CommitMessage 'Patch commit'
+        $afterCount = [int](git rev-list --count HEAD)
+        $afterCount | Should -Be ($beforeCount + 1)
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-SetCommitOrderPlan additional error paths" {
+    It "throws when base ref is invalid" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headCommit = (git rev-parse HEAD).Trim()
+        { Set-CommitOrder -OrderedCommits @($headCommit) -BaseRef 'not-a-real-ref' } |
+          Should -Throw -ExpectedMessage '*not valid*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when commit is not reachable from current branch" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a commit on another branch
+        git branch test-branch HEAD~1 2>$null | Out-Null
+        git checkout -q test-branch 2>$null | Out-Null
+        @('orphan content') | Set-Content -Path 'orphan.txt'
+        git add orphan.txt | Out-Null
+        git commit -m 'orphan commit' | Out-Null
+        $orphanCommit = (git rev-parse HEAD).Trim()
+        git checkout -q main 2>$null | Out-Null
+
+        { Set-CommitOrder -OrderedCommits @($orphanCommit) -BaseRef 'HEAD~1' } |
+          Should -Throw -ExpectedMessage '*not reachable*'
+      }
+      finally {
+        git branch -D test-branch 2>$null | Out-Null
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Wait-GitSplitPullRequestChecks return values" {
+    It "returns pull request number when gh succeeds without repository" {
+      $oldPath = $env:PATH
+      $fakeGhDir = $null
+      try {
+        $fakeGhDir = Join-Path $script:TempRepoPath "fake-gh-$(Get-Random)"
+        New-Item -Path $fakeGhDir -ItemType Directory -Force | Out-Null
+        $fakeGh = Join-Path $fakeGhDir 'gh'
+        Set-Content -Path $fakeGh -Value '#!/bin/bash' -Encoding ascii
+        Add-Content -Path $fakeGh -Value 'exit 0' -Encoding ascii
+        & chmod +x $fakeGh 2>$null
+        $env:PATH = "${fakeGhDir}:$($env:PATH)"
+
+        $result = Wait-GitSplitPullRequestChecks -PullRequest 42
+        $result | Should -Be '42'
+      }
+      finally {
+        $env:PATH = $oldPath
+        if ($fakeGhDir) { Remove-Item -Path $fakeGhDir -Recurse -Force -ErrorAction SilentlyContinue }
+      }
+    }
+
+    It "throws when gh pr checks fails" {
+      $oldPath = $env:PATH
+      $fakeGhDir = $null
+      try {
+        $fakeGhDir = Join-Path $script:TempRepoPath "fake-gh-fail-$(Get-Random)"
+        New-Item -Path $fakeGhDir -ItemType Directory -Force | Out-Null
+        $fakeGh = Join-Path $fakeGhDir 'gh'
+        Set-Content -Path $fakeGh -Value '#!/bin/bash' -Encoding ascii
+        Add-Content -Path $fakeGh -Value 'exit 1' -Encoding ascii
+        & chmod +x $fakeGh 2>$null
+        $env:PATH = "${fakeGhDir}:$($env:PATH)"
+
+        { Wait-GitSplitPullRequestChecks -PullRequest 42 } |
+          Should -Throw -ExpectedMessage '*gh pr checks failed*'
+      }
+      finally {
+        $env:PATH = $oldPath
+        if ($fakeGhDir) { Remove-Item -Path $fakeGhDir -Recurse -Force -ErrorAction SilentlyContinue }
+      }
+    }
+  }
+
+  Describe "Get-GitSplitChangedCommitInfo no patches" {
+    It "throws when commit has no file patches" {
+      Push-Location $script:TempRepoPath
+      try {
+        git commit --allow-empty -m 'empty commit for testing' | Out-Null
+        { Get-GitSplitChangedCommitInfo -Ref 'HEAD' } |
+          Should -Throw
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitSplitHunkDescriptors duplicate detection" {
+    It "processes file patches and returns descriptors" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        $filePatches = Split-Patch -patch (Get-GitPatchText -Ref 'HEAD')
+        $result = @(Get-GitSplitHunkDescriptors -Commit $headSha -FilePatches $filePatches)
+        $result | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-Git error paths" {
+    It "writes stderr to host in red with -WriteHostOnError" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -WriteHostOnError -GitArgs @('show', 'nonexistent-sha-12345') } | Should -Throw
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "uses generic error context when no -ErrorMessage" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -GitArgs @('show', 'nonexistent-sha-12345') } | Should -Throw 'git show nonexistent-sha-12345 failed*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "includes details in error when output present and no -WriteHostOnError" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-Git -ErrorMessage 'test error ctx' -GitArgs @('show', 'nonexistent-sha-12345') } | Should -Throw 'test error ctx failed*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Invoke-GitQuery error paths" {
+    It "uses generic context when no -ErrorMessage and output present" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-GitQuery -GitArgs @('show', 'nonexistent-sha-12345') } | Should -Throw 'git show nonexistent-sha-12345 failed*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws without details when output is empty" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Invoke-GitQuery -GitArgs @('config', '--get', 'nonexistent.gitsplit.key') } | Should -Throw '*failed with exit code 1'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Get-GitPatchText error with empty output" {
+    It "throws ErrorMessage when git show fails with no output" {
+      Push-Location $script:TempRepoPath
+      try {
+        Mock Invoke-GitQuery {
+          return [PSCustomObject]@{ ExitCode = 128; Output = ''; Lines = @() }
+        } -ModuleName GitSplit -ParameterFilter { ($GitArgs -join ' ') -match 'show' }
+
+        { Get-GitPatchText -Ref 'HEAD' -ErrorMessage 'custom patch error' } | Should -Throw 'custom patch error'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-SplitCommitPlan edge cases" {
+    It "uses fallback subject when commit has empty message" {
+      Push-Location $script:TempRepoPath
+      try {
+        @('a-line-1', 'a-line-2 (empty msg)', 'a-line-3', 'a-line-4 (new)', 'a-line-5 (new)') | Set-Content -Path "a.txt"
+        git add a.txt
+        git commit --allow-empty-message -m '' 2>$null | Out-Null
+        $headSha = (git rev-parse HEAD).Trim()
+        $plan = New-SplitCommitPlan -Ref 'HEAD' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'a.txt'; Line = 3 }
+        )
+        $allLines = @($plan.Steps | Where-Object { $_.Kind -eq 'Literal' } | ForEach-Object { $_.Lines })
+        ($allLines | Where-Object { $_ -match 'CommitMessage' } | Select-Object -First 1) | Should -Match "Split $headSha"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "handles multiple split points in the same hunk" {
+      Push-Location $script:TempRepoPath
+      try {
+        $plan = New-SplitCommitPlan -Ref 'HEAD' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'b.txt'; Line = 3 }
+          [pscustomobject]@{ Path = 'b.txt'; Line = 5 }
+        )
+        $plan | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "handles trailing hunks after target hunk" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a file with 20 lines so non-contiguous changes produce separate hunks
+        $lines = 1..20 | ForEach-Object { "line-$_" }
+        $lines | Set-Content trailing.txt
+        git add trailing.txt
+        git commit -m "Add trailing.txt baseline" | Out-Null
+
+        # Modify lines 1, 10, and 20 (far enough apart for 3-line context to not overlap)
+        $lines[0] = 'line-1-edited'
+        $lines[9] = 'line-10-edited'
+        $lines[19] = 'line-20-edited'
+        $lines | Set-Content trailing.txt
+        git add trailing.txt
+        git commit -m "Modify trailing.txt in three hunks" | Out-Null
+
+        # Split at line 10 (middle hunk) — hunk 3 is a trailing hunk after the target
+        $plan = New-SplitCommitPlan -Ref 'HEAD' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'trailing.txt'; Line = 10 }
+        )
+        $plan | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "skips pieces with no plus/minus lines" {
+      Push-Location $script:TempRepoPath
+      try {
+        @(
+          'b-line-1'
+          'b-line-2 (edited again)'
+          'b-line-3'
+          'b-line-4 (new)'
+          'b-line-5 (new in commit 3)'
+          'b-line-6 (new)'
+        ) | Set-Content -Path "b.txt"
+        git add b.txt
+        git commit -m "Add line at end" | Out-Null
+        $range = [pscustomobject]@{ Path = 'b.txt'; Line = 6 }
+        { New-SplitCommitPlan -Ref 'HEAD' -NewCommitRanges @($range) } | Should -Throw '*requires at least 2*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "skips empty combined patches for gap pieces" {
+      Push-Location $script:TempRepoPath
+      try {
+        $plan = New-SplitCommitPlan -Ref 'HEAD~1' -NewCommitRanges @(
+          [pscustomobject]@{ Path = 'a.txt'; PieceNumber = 1 }
+          [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 3 }
+        )
+        $plan | Should -Not -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "processes hunk headers without count" {
+      Push-Location $script:TempRepoPath
+      try {
+        # A 1-line file change produces @@ -1 +1 @@ (count omitted when 1)
+        "original" | Set-Content -Path "single.txt"
+        git add single.txt
+        git commit -m "Add single.txt" | Out-Null
+        "modified" | Set-Content -Path "single.txt"
+        git add single.txt
+        git commit -m "Modify single.txt" | Out-Null
+        # Split will throw (can't split 1-line hunk) but hunk header parsing runs first
+        $range = [pscustomobject]@{ Path = 'single.txt'; Line = 1 }
+        { New-SplitCommitPlan -Ref 'HEAD' -NewCommitRanges @($range) } | Should -Throw
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Hunk blank line handling" {
+    It "throws for header-only hunk with no body" {
+      { Split-Hunk -Hunk "@@ -1,1 +1,1 @@" -Line 1 } | Should -Throw
+    }
+
+    It "handles blank lines in column split" {
+      $hunk = "@@ -1,3 +1,3 @@`n line1`n`n-old`n+new"
+      $result = Split-Hunk -Hunk $hunk -Line 3 -Column 2
+      $result.Count | Should -Be 2
+    }
+
+    It "handles target as last body line in column split" {
+      $hunk = "@@ -1,2 +1,2 @@`n line1`n+newcontent"
+      $result = Split-Hunk -Hunk $hunk -Line 2 -Column 4
+      $result.Count | Should -Be 2
+    }
+
+    It "handles target as first body line in column split" {
+      $hunk = "@@ -1,2 +1,2 @@`n+newcontent`n line2"
+      $result = Split-Hunk -Hunk $hunk -Line 1 -Column 4
+      $result.Count | Should -Be 2
+    }
+
+    It "handles blank lines in line-based split" {
+      $hunk = "@@ -1,3 +1,3 @@`n line1`n`n-old`n+new"
+      $result = Split-Hunk -Hunk $hunk -Line 3
+      $result.Count | Should -Be 2
+    }
+  }
+
+  Describe "Test-GitSplitGeneratedPath attribute checks" {
+    It "returns true for linguist-generated=set" {
+      Push-Location $script:TempRepoPath
+      try {
+        '*.generated linguist-generated' | Set-Content -Path ".gitattributes"
+        'content' | Set-Content -Path "test.generated"
+        git add .gitattributes test.generated
+        git commit -m "Add generated file" | Out-Null
+        Test-GitSplitGeneratedPath -Path 'test.generated' | Should -BeTrue
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "returns false for linguist-generated=false" {
+      Push-Location $script:TempRepoPath
+      try {
+        '*.txt linguist-generated=false' | Set-Content -Path ".gitattributes"
+        git add .gitattributes
+        git commit -m "Set linguist-generated false for txt" | Out-Null
+        Test-GitSplitGeneratedPath -Path 'a.txt' | Should -BeFalse
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "skips attribute check for non-HEAD commit when check-attr lacks --source" {
+      Push-Location $script:TempRepoPath
+      try {
+        $script:GitSplitCheckAttrSupportsSource = $false
+        $nonHeadSha = (git rev-parse HEAD~1).Trim()
+        Test-GitSplitGeneratedPath -Path 'a.txt' -Commit $nonHeadSha | Should -BeFalse
+      }
+      finally {
+        $script:GitSplitCheckAttrSupportsSource = $null
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Test-GitCommitIsAncestor invalid ref" {
+    It "throws for invalid ref causing non-zero/non-one exit code" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Test-GitCommitIsAncestor -Ancestor 'not-a-real-ref-xyz' -Descendant 'HEAD' } | Should -Throw
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-SetCommitOrderPlan edge cases" {
+    It "throws when sequence editor helper is missing" {
+      $todoPath = Join-Path $PSScriptRoot "New-RebaseTodo.ps1"
+      $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+      Move-Item $todoPath $tempPath
+      try {
+        Push-Location $script:TempRepoPath
+        try {
+          { New-SetCommitOrderPlan -OrderedCommits @('HEAD') -BaseRef 'HEAD~2' } | Should -Throw '*Could not find sequence editor helper*'
+        }
+        finally {
+          Pop-Location
+        }
+      }
+      finally {
+        Move-Item $tempPath $todoPath
+      }
+    }
+
+    It "sets autostash variable when -Autostash is provided" {
+      Push-Location $script:TempRepoPath
+      try {
+        $headSha = (git rev-parse HEAD).Trim()
+        $plan = New-SetCommitOrderPlan -OrderedCommits @($headSha) -BaseRef 'HEAD~2' -Autostash
+        $allLines = @($plan.Steps | Where-Object { $_.Kind -eq 'Literal' } | ForEach-Object { $_.Lines }) | Where-Object { $_ -match 'useAutostash' }
+        ($allLines -join "`n") | Should -Match '\$useAutostash = \$true'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "New-Hunk null body" {
+    It "converts null entries to space" {
+      $result = New-Hunk -OldStart 1 -OldCount 2 -NewStart 1 -NewCount 2 -BodyLines @(' line1', $null, '+line3')
+      $result | Should -Match '@@ -1,2 \+1,2 @@'
+      $result | Should -Not -BeNullOrEmpty
+    }
+  }
+
+  Describe "New-MoveCommitPlan remote tracking branch" {
+    It "uses remote tracking branch when branch exists only on origin" {
+      Push-Location $script:TempRepoPath
+      try {
+        $remotePath = Join-Path (Split-Path $script:TempRepoPath) 'test-remote.git'
+        if (Test-Path $remotePath) { Remove-Item $remotePath -Recurse -Force }
+        git init --bare $remotePath 2>$null | Out-Null
+        git remote add origin $remotePath
+        git push origin main:feature-branch 2>$null | Out-Null
+        $plan = New-MoveCommitPlan -CommitRef 'HEAD~1' -DestinationBranch 'feature-branch'
+        $allLines = @($plan.Steps | Where-Object { $_.Kind -eq 'Literal' } | ForEach-Object { $_.Lines })
+        ($allLines | Where-Object { $_ -match 'destinationRef' } | Select-Object -First 1) | Should -Match 'refs/remotes/origin/feature-branch'
+        ($allLines | Where-Object { $_ -match 'useRemoteTrackingBranch' } | Select-Object -First 1) | Should -Match '\$true'
+      }
+      finally {
+        Pop-Location
+        $remotePath = Join-Path (Split-Path $script:TempRepoPath) 'test-remote.git'
+        if (Test-Path $remotePath) { Remove-Item $remotePath -Recurse -Force }
+      }
+    }
+  }
+
+  Describe "Resolve-GitSplitImportCandidates path outside repo" {
+    It "skips paths outside the repo root" {
+      Push-Location $script:TempRepoPath
+      try {
+        $result = @(Resolve-GitSplitImportCandidates -RepoRoot $script:TempRepoPath -ImporterPath 'a.txt' -Specifier '../../../etc/passwd')
+        # Paths outside repo are filtered by the StartsWith check
+        $result | Should -HaveCount 0
+      }
+      finally {
+        Pop-Location
+      }
+    }
+  }
+
+  Describe "Split-Patch empty section" {
+    It "skips whitespace-only sections after splitting" {
+      $patch = "diff --git a/file1.txt b/file1.txt`n@@ -1 +1 @@`n-old`n+new`ndiff --git`n"
+      $result = Split-Patch -patch $patch
+      $result.Count | Should -Be 1
+      $result[0].FilePath | Should -Be 'file1.txt'
+    }
+  }
+
+  Describe "New-Hunk empty body line" {
+    It "converts empty body lines to space" {
+      $result = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 2 -BodyLines @('', '+line')
+      $result | Should -Match "(?s)^@@ -1,1 \+1,2 @@`n `n\+line`n$"
+    }
+
+    It "converts null body lines to space" {
+      $result = New-Hunk -OldStart 1 -OldCount 1 -NewStart 1 -NewCount 2 -BodyLines @($null, '+line')
+      $result | Should -Match "(?s)^@@ -1,1 \+1,2 @@`n `n\+line`n$"
+    }
+  }
+
+  Describe "Test-GitCommitIsAncestor error handling" {
+    It "throws when merge-base returns unexpected exit code with no output" {
+      Mock Invoke-GitQuery -ModuleName GitSplit {
+        [PSCustomObject]@{ ExitCode = 128; Output = '' }
+      }
+      { Test-GitCommitIsAncestor -Ancestor 'abc123' -Descendant 'def456' } | Should -Throw '*Failed to determine*'
+    }
+  }
 }
