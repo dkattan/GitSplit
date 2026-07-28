@@ -823,9 +823,6 @@ function New-MoveCommitPlan {
     [switch]$RemoveFromSource,
 
     [Parameter()]
-    [switch]$AutoResolveConflicts,
-
-    [Parameter()]
     [switch]$Push,
 
     [Parameter()]
@@ -874,10 +871,14 @@ function New-MoveCommitPlan {
     $destinationCreateBaseCommit = Resolve-GitCommit -Ref $destinationCreateBaseRef -ErrorMessage "Base reference '$destinationCreateBaseRef' is not valid."
   }
   elseif ($CreateDestinationBranch) {
+    $deleteHints = @("  git branch -D $DestinationBranch")
+    if ($remoteBranchExists) {
+      $deleteHints += "  git push origin --delete $DestinationBranch"
+    }
     throw @(
       "Destination branch '$DestinationBranch' already exists locally or on origin."
-      "Remove -CreateDestinationBranch or choose a different branch name."
-    ) -join [Environment]::NewLine
+      "Either omit -CreateDestinationBranch to use the existing branch, or delete it first:"
+    ) + $deleteHints -join [Environment]::NewLine
   }
 
   $destinationRef = if ($planCreatesDestinationBranch) {
@@ -917,7 +918,6 @@ function New-MoveCommitPlan {
     '$destinationRef = ' + (ConvertTo-PowerShellStringLiteral $destinationRef)
     '$useRemoteTrackingBranch = ' + $(if ($useRemoteTrackingBranch) { '$true' } else { '$false' })
     '$autoStash = ' + $(if ($AutoStash) { '$true' } else { '$false' })
-    '$autoResolveConflicts = ' + $(if ($AutoResolveConflicts) { '$true' } else { '$false' })
     '$pushDestination = ' + $(if ($Push) { '$true' } else { '$false' })
     '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
     '$destWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedDestWorktreePath)
@@ -987,9 +987,12 @@ function New-MoveCommitPlan {
     'if ($LASTEXITCODE -ne 0) {'
     '  throw "Failed to determine git status."'
     '}'
-    'if ($status.Count -gt 0) {'
+    '$untrackedFiles = @($status | Where-Object { $_ -match "^\?\? " })'
+    '$modifiedFiles = @($status | Where-Object { $_ -notmatch "^\?\? " })'
+    'if ($modifiedFiles.Count -gt 0) {'
     '  if (-not $autoStash) {'
-    '    throw "Uncommitted changes detected. Re-run with -AutoStash, or commit/stash your changes before running this script."'
+    '    $fileList = ($modifiedFiles | ForEach-Object { $_.Substring(3) }) -join ", "'
+    '    throw "Uncommitted changes detected in: $fileList. Re-run with -AutoStash, or commit/stash your changes before running this script."'
     '  }'
     '  $stashName = $plannedStashName'
     '  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
@@ -997,6 +1000,17 @@ function New-MoveCommitPlan {
     '    throw "git stash push failed"'
     '  }'
     '  $stashed = $true'
+    '}'
+    'elseif ($untrackedFiles.Count -gt 0 -and $autoStash) {'
+    '  $stashName = $plannedStashName'
+    '  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) {'
+    '    throw "git stash push failed"'
+    '  }'
+    '  $stashed = $true'
+    '}'
+    'elseif ($untrackedFiles.Count -gt 0) {'
+    '  Write-Warning "Untracked files present ($($untrackedFiles.Count)). They will not be affected by this operation."'
     '}'
   )
 
@@ -1067,8 +1081,10 @@ function New-MoveCommitPlan {
 
   $executionLines += @(
     '  $destWorktreeCreated = $true'
+    '  $destWorktreeCherryPickConflicted = $false'
     '  & git @longPathGitArgs -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '  if ($LASTEXITCODE -ne 0) {'
+    '    $destWorktreeCherryPickConflicted = $true'
     '    throw "git -C <worktree> cherry-pick failed for $commitHash"'
     '  }'
     '  if ($pushDestination) {'
@@ -1100,71 +1116,72 @@ function New-MoveCommitPlan {
     }
     else {
       $rebaseOntoLine = '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      if ($AutoResolveConflicts) {
-        $executionLines += @(
-          '  $oldGitEditor = $env:GIT_EDITOR',
-          '  $oldGitSeqEditor = $env:GIT_SEQUENCE_EDITOR',
-          '  $env:GIT_EDITOR = '':''',
-          '  $env:GIT_SEQUENCE_EDITOR = '':''',
-          '  try {',
-          '    $rebaseComplete = $false',
-          '    $rebaseCommitCount = 0',
-          '    $rebaseCountOutput = (& git @longPathGitArgs -C $sourceWorktreePath rev-list --count "$commitHash..HEAD" 2>$null)',
-          '    if ($LASTEXITCODE -eq 0 -and $rebaseCountOutput) {',
-          '      $rebaseCommitCount = [int]($rebaseCountOutput.Trim())',
-          '    }',
-          '    $rebaseMaxRetries = $rebaseCommitCount + 2',
-          '    if ($rebaseMaxRetries -lt 1) { $rebaseMaxRetries = 100 }',
-          '    for ($rebaseRetry = 0; $rebaseRetry -lt $rebaseMaxRetries -and -not $rebaseComplete; $rebaseRetry++) {',
-          '      if ($rebaseRetry -eq 0) {',
-          $rebaseOntoLine,
-          '      }',
-          '      else {',
-          '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --continue 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
-          '      }',
-          '      if ($LASTEXITCODE -eq 0) {',
-          '        $rebaseComplete = $true',
-          '        break',
-          '      }',
-          '      $addedFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff-tree --diff-filter=A --no-commit-id --name-only -z -r $commitHash 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
-          '      $conflictFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff --name-only --diff-filter=U -z 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
-          '      $resolvedAny = $false',
-          '      foreach ($conflictFile in $conflictFiles) {',
-          '        if ($addedFiles -ccontains $conflictFile) {',
-          '          & git @longPathGitArgs -C $sourceWorktreePath rm -f -- $conflictFile 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
-          '          $resolvedAny = $true',
-          '        }',
-          '      }',
-          '      if (-not $resolvedAny) {',
-          '        throw "git -C <source-worktree> rebase --onto failed: unable to auto-resolve (no modify/delete conflict on a file created by the moved commit)"',
-          '      }',
-          '    }',
-          '    if (-not $rebaseComplete) {',
-          '      throw "git -C <source-worktree> rebase did not complete after $rebaseMaxRetries retries while removing $commitHash from $expectedBranch"',
-          '    }',
-          '  }',
-          '  finally {',
-          '    $env:GIT_EDITOR = $oldGitEditor',
-          '    $env:GIT_SEQUENCE_EDITOR = $oldGitSeqEditor',
-          '  }',
-          '  $rewrittenHead = (& git @longPathGitArgs -C $sourceWorktreePath rev-parse HEAD).Trim()',
-          '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {',
-          '    throw "Failed to resolve rewritten source head for $expectedBranch."',
-          '  }'
-        )
-      }
-      else {
-        $executionLines += @(
-          ( '  ' + $rebaseOntoLine.TrimStart()),
-          '  if ($LASTEXITCODE -ne 0) {',
-          '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"',
-          '  }',
-          '  $rewrittenHead = (& git @longPathGitArgs -C $sourceWorktreePath rev-parse HEAD).Trim()',
-          '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {',
-          '    throw "Failed to resolve rewritten source head for $expectedBranch."',
-          '  }'
-        )
-      }
+      $executionLines += @(
+        '  $oldGitEditor = $env:GIT_EDITOR',
+        '  $oldGitSeqEditor = $env:GIT_SEQUENCE_EDITOR',
+        '  $env:GIT_EDITOR = '':''',
+        '  $env:GIT_SEQUENCE_EDITOR = '':''',
+        '  try {',
+        '    $rebaseComplete = $false',
+        '    $rebaseCommitCount = 0',
+        '    $rebaseCountOutput = (& git @longPathGitArgs -C $sourceWorktreePath rev-list --count "$commitHash..HEAD" 2>$null)',
+        '    if ($LASTEXITCODE -eq 0 -and $rebaseCountOutput) {',
+        '      $rebaseCommitCount = [int]($rebaseCountOutput.Trim())',
+        '    }',
+        '    $rebaseMaxRetries = $rebaseCommitCount + 2',
+        '    if ($rebaseMaxRetries -lt 1) { $rebaseMaxRetries = 100 }',
+        '    for ($rebaseRetry = 0; $rebaseRetry -lt $rebaseMaxRetries -and -not $rebaseComplete; $rebaseRetry++) {',
+        '      if ($rebaseRetry -eq 0) {',
+        $rebaseOntoLine,
+        '      }',
+        '      else {',
+        '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --continue 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+        '      }',
+        '      if ($LASTEXITCODE -eq 0) {',
+        '        $rebaseComplete = $true',
+        '        break',
+        '      }',
+        '      $addedFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff-tree --diff-filter=A --no-commit-id --name-only -z -r $commitHash 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
+        '      $conflictFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff --name-only --diff-filter=U -z 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
+        '      $resolvedAny = $false',
+        '      foreach ($conflictFile in $conflictFiles) {',
+        '        if ($addedFiles -ccontains $conflictFile) {',
+        '          & git @longPathGitArgs -C $sourceWorktreePath rm -f -- $conflictFile 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+        '          $resolvedAny = $true',
+        '        }',
+        '      }',
+        '      if (-not $resolvedAny) {',
+        '        if ($conflictFiles.Count -eq 0) {',
+        '          throw "git rebase --onto failed while removing $commitHash from $expectedBranch for a non-conflict reason. Check the Git output above for details."',
+        '        }',
+        '        $unresolvedFiles = $conflictFiles -join ", "',
+        '        throw "git rebase --onto failed while removing $commitHash from $expectedBranch. Conflicted files not created by the moved commit: $unresolvedFiles. These conflicts require manual resolution."',
+        '      }',
+        '      # After resolving, the commit may be empty (e.g. it only modified the removed file).',
+        '      # git rebase --continue fails on empty commits; use --skip to drop them.',
+        '      & git @longPathGitArgs -C $sourceWorktreePath diff --cached --quiet 2>$null',
+        '      if ($LASTEXITCODE -eq 0) {',
+        '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --skip 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+        '        if ($LASTEXITCODE -eq 0) {',
+        '          $rebaseComplete = $true',
+        '          break',
+        '        }',
+        '        continue',
+        '      }',
+        '    }',
+        '    if (-not $rebaseComplete) {',
+        '      throw "git rebase did not complete after $rebaseMaxRetries retries while removing $commitHash from $expectedBranch"',
+        '    }',
+        '  }',
+        '  finally {',
+        '    $env:GIT_EDITOR = $oldGitEditor',
+        '    $env:GIT_SEQUENCE_EDITOR = $oldGitSeqEditor',
+        '  }',
+        '  $rewrittenHead = (& git @longPathGitArgs -C $sourceWorktreePath rev-parse HEAD).Trim()',
+        '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {',
+        '    throw "Failed to resolve rewritten source head for $expectedBranch."',
+        '  }'
+      )
     }
 
     $executionLines += @(
@@ -1206,28 +1223,33 @@ function New-MoveCommitPlan {
 
   if ($sourceRemovalPlan) {
     $executionLines += @(
-      '  if ($moveSucceeded -and $sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
+      '  if ($sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
       '    & git @longPathGitArgs worktree remove --force $sourceWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '    if ($LASTEXITCODE -ne 0) {'
-      '      throw "git worktree remove --force failed for ''$sourceWorktreePath''."'
+      '      Write-Warning "Failed to remove source worktree at ''$sourceWorktreePath''. Run: git worktree remove --force ''$sourceWorktreePath''"'
       '    }'
-      '  }'
-      '  elseif ($sourceWorktreeCreated -and $sourceWorktreePath -and (Test-Path -LiteralPath $sourceWorktreePath)) {'
-      '    Write-Warning "Preserving source worktree at ''$sourceWorktreePath'' so conflicts can be resolved manually."'
       '  }'
       ''
     )
   }
 
   $executionLines += @(
-    '  if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
-    '    & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-    '    if ($LASTEXITCODE -ne 0) {'
-    '      throw "git worktree remove --force failed for ''$destWorktreePath''."'
+    '  if ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
+    '    if ($moveSucceeded) {'
+    '      & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '      if ($LASTEXITCODE -ne 0) {'
+    '        throw "git worktree remove --force failed for ''$destWorktreePath''."'
+    '      }'
     '    }'
-    '  }'
-    '  elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {'
-    '    Write-Warning "Preserving destination worktree at ''$destWorktreePath'' so conflicts can be resolved manually."'
+    '    elseif ($destWorktreeCreated -and -not $destWorktreeCherryPickConflicted) {'
+    '      & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '      if ($LASTEXITCODE -ne 0) {'
+    '        Write-Warning "Failed to remove destination worktree at ''$destWorktreePath''. Run: git worktree remove --force ''$destWorktreePath''"'
+    '      }'
+    '    }'
+    '    else {'
+    '      Write-Warning "Preserving destination worktree at ''$destWorktreePath'' so conflicts can be resolved manually."'
+    '    }'
     '  }'
     ''
     '  if (Test-Path -LiteralPath $disabledHooksPath) {'
@@ -1291,7 +1313,8 @@ function New-MoveCommitPlan {
 
   $steps += New-GitStep -Kind Comment -Lines @(
     'Execute the destination cherry-pick in an isolated worktree, then optionally rewrite the source branch.',
-    'Cleanup removes successful temporary worktrees and preserves conflicted ones for manual resolution.'
+    'Cleanup removes temporary worktrees on success and on source rebase failure.'
+    'Destination worktrees are preserved only when the cherry-pick itself conflicts.'
   )
   $steps += New-GitStep -Kind Literal -Lines $executionLines
 
@@ -1304,7 +1327,6 @@ function New-MoveCommitPlan {
     SourceBranch        = $currentBranch
     SourceHead          = $currentHead
     RemoveFromSource    = [bool]$RemoveFromSource
-    AutoResolveConflicts = [bool]$AutoResolveConflicts
     PushDestination     = [bool]$Push
     AutoStash           = [bool]$AutoStash
     OutputScriptCapable = $true
@@ -1564,9 +1586,9 @@ function Split-Hunk {
       $line2 = "$targetPrefix$right"
 
       # Replace one line with two lines.
-      $pre = if ($targetBodyIndex -gt 0) { $body[0..($targetBodyIndex - 1)] } else { @() }
-      $post = if ($targetBodyIndex -lt ($body.Count - 1)) { $body[($targetBodyIndex + 1)..($body.Count - 1)] } else { @() }
-      $body = @($pre + @($line1, $line2) + $post)
+      $pre = if ($targetBodyIndex -gt 0) { , [object[]]@($body[0..($targetBodyIndex - 1)]) } else { , [object[]]@() }
+      $post = if ($targetBodyIndex -lt ($body.Count - 1)) { , [object[]]@($body[($targetBodyIndex + 1)..($body.Count - 1)]) } else { , [object[]]@() }
+      $body = [object[]]@($pre + @($line1, $line2) + $post)
 
       # The second hunk starts at the inserted second line.
       $splitIndex = $targetBodyIndex + 1
@@ -4440,7 +4462,9 @@ function Move-Commit {
 
   .PARAMETER RemoveFromSource
   If specified, removes the commit from the current branch after applying it to the destination.
-  This rewrites history.
+  This rewrites history. Modify/delete conflicts on files created by the moved commit are
+  resolved automatically (the files are removed from the source branch since they now live
+  on the destination).
 
   .PARAMETER Push
   If specified, pushes the destination branch (and source branch if RemoveFromSource) to origin.
@@ -4450,7 +4474,7 @@ function Move-Commit {
 
   .PARAMETER AutoStash
   If specified, stashes uncommitted changes at the start and restores them at the end.
-  Without AutoStash, the working tree must be clean.
+  Without AutoStash, tracked files must be clean (untracked files are allowed and unaffected).
 
   .PARAMETER OutputScriptPath
   If specified, writes a reviewable PowerShell script that performs the planned move later
@@ -4480,9 +4504,6 @@ function Move-Commit {
     [switch]$RemoveFromSource,
 
     [Parameter()]
-    [switch]$AutoResolveConflicts,
-
-    [Parameter()]
     [switch]$Push,
 
     [Parameter()]
@@ -4506,7 +4527,6 @@ function Move-Commit {
     -CommitRef $CommitRef `
     -DestinationBranch $DestinationBranch `
     -RemoveFromSource:$RemoveFromSource `
-    -AutoResolveConflicts:$AutoResolveConflicts `
     -Push:$Push `
     -ForcePushSource:$ForcePushSource `
     -AutoStash:$AutoStash `

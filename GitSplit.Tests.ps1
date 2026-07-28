@@ -2417,7 +2417,7 @@ Import-Module '$escapedManifestPath' -Force
         # This triggers a modify/delete conflict during rebase because newFile.txt was
         # created by the moved commit but is modified by the kept commit. The auto-resolve
         # logic removes newFile.txt from the source (it now lives on the destination branch).
-        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'auto-resolve-dest' -RemoveFromSource -AutoResolveConflicts | Out-Null
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'auto-resolve-dest' -RemoveFromSource | Out-Null
 
         (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
 
@@ -2464,7 +2464,7 @@ Import-Module '$escapedManifestPath' -Force
           Remove-Item -Path $scriptPath -Force
         }
 
-        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'editor-dest' -RemoveFromSource -AutoResolveConflicts -OutputScriptPath $scriptPath | Out-Null
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'editor-dest' -RemoveFromSource -OutputScriptPath $scriptPath | Out-Null
 
         $scriptText = Get-Content -Path $scriptPath -Raw
         $scriptText | Should -Match ([regex]::Escape("`$env:GIT_EDITOR = ':'"))
@@ -2592,7 +2592,6 @@ $destinationBranch = 'snapshot-dest'
 $destinationRef = 'refs/heads/snapshot-dest'
 $useRemoteTrackingBranch = $false
 $autoStash = $true
-$autoResolveConflicts = $false
 $pushDestination = $false
 $plannedStashName = 'fixed-move-commit-stash'
 $destWorktreePath = '__WORKTREE_PATH__'
@@ -2636,9 +2635,12 @@ $status = @(& git status --porcelain)
 if ($LASTEXITCODE -ne 0) {
   throw "Failed to determine git status."
 }
-if ($status.Count -gt 0) {
+$untrackedFiles = @($status | Where-Object { $_ -match "^\?\? " })
+$modifiedFiles = @($status | Where-Object { $_ -notmatch "^\?\? " })
+if ($modifiedFiles.Count -gt 0) {
   if (-not $autoStash) {
-    throw "Uncommitted changes detected. Re-run with -AutoStash, or commit/stash your changes before running this script."
+    $fileList = ($modifiedFiles | ForEach-Object { $_.Substring(3) }) -join ", "
+    throw "Uncommitted changes detected in: $fileList. Re-run with -AutoStash, or commit/stash your changes before running this script."
   }
   $stashName = $plannedStashName
   & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
@@ -2647,9 +2649,21 @@ if ($status.Count -gt 0) {
   }
   $stashed = $true
 }
+elseif ($untrackedFiles.Count -gt 0 -and $autoStash) {
+  $stashName = $plannedStashName
+  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
+  if ($LASTEXITCODE -ne 0) {
+    throw "git stash push failed"
+  }
+  $stashed = $true
+}
+elseif ($untrackedFiles.Count -gt 0) {
+  Write-Warning "Untracked files present ($($untrackedFiles.Count)). They will not be affected by this operation."
+}
 
 # Execute the destination cherry-pick in an isolated worktree, then optionally rewrite the source branch.
-# Cleanup removes successful temporary worktrees and preserves conflicted ones for manual resolution.
+# Cleanup removes temporary worktrees on success and on source rebase failure.
+# Destination worktrees are preserved only when the cherry-pick itself conflicts.
 
 $wtRoot = Join-Path $repoRoot '.gitsplit-worktrees'
 if (-not (Test-Path -LiteralPath $wtRoot)) {
@@ -2679,8 +2693,10 @@ try {
     }
   }
   $destWorktreeCreated = $true
+  $destWorktreeCherryPickConflicted = $false
   & git @longPathGitArgs -C $destWorktreePath -c "core.hooksPath=$disabledHooksPath" cherry-pick $commitHash 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
   if ($LASTEXITCODE -ne 0) {
+    $destWorktreeCherryPickConflicted = $true
     throw "git -C <worktree> cherry-pick failed for $commitHash"
   }
   if ($pushDestination) {
@@ -2692,14 +2708,22 @@ try {
   $moveSucceeded = $true
 }
 finally {
-  if ($moveSucceeded -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
-    & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
-    if ($LASTEXITCODE -ne 0) {
-      throw "git worktree remove --force failed for '$destWorktreePath'."
+  if ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
+    if ($moveSucceeded) {
+      & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
+      if ($LASTEXITCODE -ne 0) {
+        throw "git worktree remove --force failed for '$destWorktreePath'."
+      }
     }
-  }
-  elseif ($destWorktreeCreated -and $destWorktreePath -and (Test-Path -LiteralPath $destWorktreePath)) {
-    Write-Warning "Preserving destination worktree at '$destWorktreePath' so conflicts can be resolved manually."
+    elseif ($destWorktreeCreated -and -not $destWorktreeCherryPickConflicted) {
+      & git @longPathGitArgs worktree remove --force $destWorktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }
+      if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to remove destination worktree at '$destWorktreePath'. Run: git worktree remove --force '$destWorktreePath'"
+      }
+    }
+    else {
+      Write-Warning "Preserving destination worktree at '$destWorktreePath' so conflicts can be resolved manually."
+    }
   }
 
   if (Test-Path -LiteralPath $disabledHooksPath) {
