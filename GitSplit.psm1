@@ -35,16 +35,18 @@ function Invoke-Git {
   # PowerShell wraps native stderr lines as ErrorRecord objects even when redirected with 2>&1.
   # Normalize everything to plain strings so callers/hosts don't treat stderr text as PowerShell errors.
   # Use the pipeline so we can optionally stream output in real time.
-  & git @GitArgs 2>&1 | ForEach-Object {
+  $output = & git @GitArgs 2>&1 | ForEach-Object {
+    $line = $_ | Out-String
     if (!$Quiet) {
       if ($WriteHostOnError -and $_ -is [System.Management.Automation.ErrorRecord]) { 
-        $_ | Out-String | Write-Host -ForegroundColor Red
+        $line | Write-Host -ForegroundColor Red
       }
       else { 
         # Keep output visible without using the error stream.
-        $_ | Out-String | Write-Host
+        $line | Write-Host
       }
     }
+    $line
   }
   
   $exitCode = $LASTEXITCODE
@@ -441,7 +443,7 @@ function ConvertTo-PowerShellStringLiteral {
   )
 
   if ($null -eq $Value) {
-    return '$null'
+    return "''"
   }
 
   return "'" + $Value.Replace("'", "''") + "'"
@@ -1138,6 +1140,17 @@ function New-MoveCommitPlan {
           '      if (-not $resolvedAny) {',
           '        throw "git -C <source-worktree> rebase --onto failed: unable to auto-resolve (no modify/delete conflict on a file created by the moved commit)"',
           '      }',
+          '      # After resolving, the commit may be empty (e.g. it only modified the removed file).',
+          '      # git rebase --continue fails on empty commits; use --skip to drop them.',
+          '      & git @longPathGitArgs -C $sourceWorktreePath diff --cached --quiet 2>$null',
+          '      if ($LASTEXITCODE -eq 0) {',
+          '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --skip 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+          '        if ($LASTEXITCODE -eq 0) {',
+          '          $rebaseComplete = $true',
+          '          break',
+          '        }',
+          '        continue',
+          '      }',
           '    }',
           '    if (-not $rebaseComplete) {',
           '      throw "git -C <source-worktree> rebase did not complete after $rebaseMaxRetries retries while removing $commitHash from $expectedBranch"',
@@ -1564,8 +1577,8 @@ function Split-Hunk {
       $line2 = "$targetPrefix$right"
 
       # Replace one line with two lines.
-      $pre = if ($targetBodyIndex -gt 0) { $body[0..($targetBodyIndex - 1)] } else { @() }
-      $post = if ($targetBodyIndex -lt ($body.Count - 1)) { $body[($targetBodyIndex + 1)..($body.Count - 1)] } else { @() }
+      $pre = if ($targetBodyIndex -gt 0) { [object[]]@($body[0..($targetBodyIndex - 1)]) } else { [object[]]@() }
+      $post = if ($targetBodyIndex -lt ($body.Count - 1)) { [object[]]@($body[($targetBodyIndex + 1)..($body.Count - 1)]) } else { [object[]]@() }
       $body = @($pre + @($line1, $line2) + $post)
 
       # The second hunk starts at the inserted second line.
@@ -1665,9 +1678,9 @@ function New-Hunk {
   #>
   [CmdletBinding()]
   param(
-    # 1-based start line in the OLD file (the '-' side).
+    # 1-based start line in the OLD file (the '-' side). 0 for new-file hunks.
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(0, [int]::MaxValue)]
     [int]$OldStart,
 
     # Number of lines in the OLD file covered by this hunk.
@@ -1675,9 +1688,9 @@ function New-Hunk {
     [ValidateRange(0, [int]::MaxValue)]
     [int]$OldCount,
 
-    # 1-based start line in the NEW file (the '+' side).
+    # 1-based start line in the NEW file (the '+' side). 0 for deleted-file hunks.
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(0, [int]::MaxValue)]
     [int]$NewStart,
 
     # Number of lines in the NEW file covered by this hunk.
@@ -4441,6 +4454,12 @@ function Move-Commit {
   .PARAMETER RemoveFromSource
   If specified, removes the commit from the current branch after applying it to the destination.
   This rewrites history.
+
+  .PARAMETER AutoResolveConflicts
+  If specified with -RemoveFromSource, automatically resolves modify/delete conflicts that occur
+  during the source branch rebase when a descendant commit modifies a file that was created by the
+  moved commit. The file is removed from the source branch (it lives on the destination branch).
+  Without this switch, any rebase conflict aborts the move.
 
   .PARAMETER Push
   If specified, pushes the destination branch (and source branch if RemoveFromSource) to origin.
