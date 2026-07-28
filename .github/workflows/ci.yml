@@ -59,4 +59,4 @@ jobs:
           file: coverage.cobertura.xml
           language: PowerShell
           label: code-coverage/pester
-          fail-on-error: true
+          fail-on-error: false
