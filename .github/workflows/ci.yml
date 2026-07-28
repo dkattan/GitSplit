@@ -42,7 +42,8 @@ jobs:
 
           $config = New-PesterConfiguration
           $config.Run.Path = './GitSplit.Tests.ps1'
-          $config.Run.Exit = $true
+          $config.Run.Exit = $false
+          $config.Run.PassThru = $true
           $config.TestResult.Enabled = $true
           $config.Output.Verbosity = 'Detailed'
           $config.CodeCoverage.Enabled = $true
@@ -50,7 +51,44 @@ jobs:
           $config.CodeCoverage.OutputFormat = 'Cobertura'
           $config.CodeCoverage.OutputPath = './coverage.cobertura.xml'
 
-          Invoke-Pester -Configuration $config
+          $result = Invoke-Pester -Configuration $config
+
+          # GitHub Actions step summary (Markdown rendered on the run page)
+          $icon = if ($result.FailedCount -eq 0) { '✅' } else { '❌' }
+          @(
+              "## $icon Pester Test Results"
+              ''
+              '| Metric | Count |'
+              '| --- | --- |'
+              "| Total | $($result.TotalCount) |"
+              "| ✅ Passed | $($result.PassedCount) |"
+              "| ❌ Failed | $($result.FailedCount) |"
+              "| ⏭️ Skipped | $($result.SkippedCount) |"
+              "| ⏱️ Duration | $([math]::Round($result.Duration.TotalSeconds, 1))s |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+          # Inline annotations for failures — surfaces on PR "Files changed" and Checks tab
+          if ($result.FailedCount -gt 0) {
+              "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              "### ❌ Failed tests" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              foreach ($test in $result.Failed) {
+                  $message = $test.ErrorRecord.Exception.Message -replace '\r?\n', ' '
+                  $file = $test.ScriptBlock.File
+                  $line = $test.ScriptBlock.StartPosition.StartLine
+                  "- **$($test.ExpandedPath)** — $message" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+                  if ($file -and $line) {
+                      Write-Host "::error file=$file,line=$line::$($test.ExpandedPath): $message"
+                  }
+                  else {
+                      Write-Host "::error::$($test.ExpandedPath): $message"
+                  }
+              }
+          }
+
+          if ($result.FailedCount -gt 0) {
+              throw "Pester reported $($result.FailedCount) failing test(s)."
+          }
 
       - name: Upload coverage
         if: always()
