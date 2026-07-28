@@ -1391,6 +1391,76 @@ Import-Module '$escapedManifestPath' -Force
         Pop-Location
       }
     }
+
+    It "groups hunks by PieceNumber across multiple files in a single commit" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create three files with 30 lines each for well-separated hunks.
+        $lines = 1..30 | ForEach-Object { "line-$_" }
+        $lines | Set-Content -Path 'fileA.txt'
+        $lines | Set-Content -Path 'fileB.txt'
+        $lines | Set-Content -Path 'fileC.txt'
+        git add fileA.txt fileB.txt fileC.txt | Out-Null
+        git commit -m 'Add fileA, fileB, fileC' | Out-Null
+
+        # Modify all three files with 3 well-separated hunks per file (lines 2, 15, 28).
+        $modLines = 1..30 | ForEach-Object {
+          if ($_ -in @(2, 15, 28)) { "line-$_ changed" } else { "line-$_" }
+        }
+        $modLines | Set-Content -Path 'fileA.txt'
+        $modLines | Set-Content -Path 'fileB.txt'
+        $modLines | Set-Content -Path 'fileC.txt'
+        git add fileA.txt fileB.txt fileC.txt | Out-Null
+        git commit -m 'Modify all three files with 3 hunks each' | Out-Null
+
+        # Assign fileB's last hunk to piece 2; everything else defaults to piece 1.
+        $targetHunk = @(Get-GitSplitHunks -Ref 'HEAD' | Where-Object { $_.Path -eq 'fileB.txt' } | Select-Object -Last 1)
+        $targetHunk | Should -HaveCount 1
+
+        $beforeCount = [int](git rev-list --count HEAD)
+        $created = @(Split-Commit -Ref 'HEAD' -NewCommitRanges @(
+            [pscustomobject]@{ HunkId = $targetHunk[0].HunkId; PieceNumber = 2 }
+          ))
+
+        # Should create exactly 2 split pieces, not 3 (one per hunk in fileB).
+        $created | Should -HaveCount 2
+        ([int](git rev-list --count HEAD)) | Should -Be ($beforeCount + 1)
+
+        # Piece 1 should contain changes to all 3 files (fileA + fileC all hunks + fileB first 2 hunks).
+        git checkout --detach -q $created[0] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout first split commit $($created[0])"
+        }
+        $firstA = @(Get-Content -Path 'fileA.txt')
+        $firstB = @(Get-Content -Path 'fileB.txt')
+        $firstC = @(Get-Content -Path 'fileC.txt')
+        # fileA: all 3 hunks applied
+        $firstA[1] | Should -Be 'line-2 changed'
+        $firstA[14] | Should -Be 'line-15 changed'
+        $firstA[27] | Should -Be 'line-28 changed'
+        # fileB: first 2 hunks applied, last hunk NOT applied
+        $firstB[1] | Should -Be 'line-2 changed'
+        $firstB[14] | Should -Be 'line-15 changed'
+        $firstB[27] | Should -Be 'line-28'
+        # fileC: all 3 hunks applied
+        $firstC[1] | Should -Be 'line-2 changed'
+        $firstC[14] | Should -Be 'line-15 changed'
+        $firstC[27] | Should -Be 'line-28 changed'
+
+        # Piece 2 should contain only fileB's last hunk.
+        git checkout --detach -q $created[1] 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          throw "Expected to be able to checkout second split commit $($created[1])"
+        }
+        $finalB = @(Get-Content -Path 'fileB.txt')
+        $finalB[1] | Should -Be 'line-2 changed'
+        $finalB[14] | Should -Be 'line-15 changed'
+        $finalB[27] | Should -Be 'line-28 changed'
+      }
+      finally {
+        Pop-Location
+      }
+    }
   }
 
   Describe "Split-Commit guardrails" {
@@ -2314,6 +2384,99 @@ Import-Module '$escapedManifestPath' -Force
         Pop-Location
       }
     }
+
+    It "auto-removes files created by moved commit from source during modify/delete conflicts" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+
+        git branch auto-resolve-dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Commit that CREATES a new file — this is the commit to MOVE.
+        'new-file-content' | Set-Content -Path 'newFile.txt'
+        git add newFile.txt | Out-Null
+        $msgToMove = "Add newFile to MOVE $(New-Guid)"
+        git commit -m $msgToMove | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Later commit that MODIFIES the new file AND another file — this stays in the source branch.
+        # When the move commit is removed via rebase --onto, this commit will hit a
+        # modify/delete conflict because newFile.txt no longer exists in the rebased history.
+        @(
+          'new-file-content'
+          'modified-line'
+        ) | Set-Content -Path 'newFile.txt'
+        'extra-a-line-for-keep' | Add-Content -Path 'a.txt'
+        git add newFile.txt a.txt | Out-Null
+        $msgToKeep = "Modify newFile to KEEP $(New-Guid)"
+        git commit -m $msgToKeep | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        # Move the commit that created newFile.txt, removing it from source.
+        # This triggers a modify/delete conflict during rebase because newFile.txt was
+        # created by the moved commit but is modified by the kept commit. The auto-resolve
+        # logic removes newFile.txt from the source (it now lives on the destination branch).
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'auto-resolve-dest' -RemoveFromSource -AutoResolveConflicts | Out-Null
+
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+
+        # Source branch should no longer contain newFile.txt (it was auto-removed).
+        Test-Path 'newFile.txt' | Should -BeFalse
+
+        # Source branch should still contain the later commit.
+        $sourceSubjects = (git log -n 50 --pretty=format:%s) -join "`n"
+        $sourceSubjects | Should -Not -Match ([regex]::Escape($msgToMove))
+        $sourceSubjects | Should -Match ([regex]::Escape($msgToKeep))
+
+        # Destination should contain the moved commit and the file.
+        $destSubjects = (git log auto-resolve-dest -n 50 --pretty=format:%s) -join "`n"
+        $destSubjects | Should -Match ([regex]::Escape($msgToMove))
+        git -C (Join-Path $script:TempRepoPath '.gitsplit-worktrees') rev-parse HEAD 2>$null | Out-Null
+        # Verify the file exists on the destination branch.
+        $destFileContent = @(git show "auto-resolve-dest:newFile.txt" 2>$null)
+        $destFileContent | Should -Contain 'new-file-content'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "sets GIT_EDITOR and GIT_SEQUENCE_EDITOR in Move-Commit rebase scripts" {
+      $scriptPath = $null
+      Push-Location $script:TempRepoPath
+      try {
+        git branch editor-dest | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'editor-line-1' | Add-Content -Path 'b.txt'
+        git add b.txt | Out-Null
+        git commit -m "Editor move $(New-Guid)" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        'editor-line-2' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m "Editor keep $(New-Guid)" | Out-Null
+        $LASTEXITCODE | Should -Be 0
+
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("move-commit-editor-" + (New-Guid) + ".ps1")
+        if (Test-Path $scriptPath) {
+          Remove-Item -Path $scriptPath -Force
+        }
+
+        Move-Commit -CommitRef HEAD~1 -DestinationBranch 'editor-dest' -RemoveFromSource -AutoResolveConflicts -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Match ([regex]::Escape("`$env:GIT_EDITOR = ':'"))
+        $scriptText | Should -Match ([regex]::Escape("`$env:GIT_SEQUENCE_EDITOR = ':'"))
+      }
+      finally {
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+          Remove-Item -Path $scriptPath -Force
+        }
+        Pop-Location
+      }
+    }
   }
 
   Describe "Deterministic test hooks" {
@@ -2429,6 +2592,7 @@ $destinationBranch = 'snapshot-dest'
 $destinationRef = 'refs/heads/snapshot-dest'
 $useRemoteTrackingBranch = $false
 $autoStash = $true
+$autoResolveConflicts = $false
 $pushDestination = $false
 $plannedStashName = 'fixed-move-commit-stash'
 $destWorktreePath = '__WORKTREE_PATH__'

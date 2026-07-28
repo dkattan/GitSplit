@@ -35,7 +35,7 @@ function Invoke-Git {
   # PowerShell wraps native stderr lines as ErrorRecord objects even when redirected with 2>&1.
   # Normalize everything to plain strings so callers/hosts don't treat stderr text as PowerShell errors.
   # Use the pipeline so we can optionally stream output in real time.
-  $output = @(& git @GitArgs 2>&1 | ForEach-Object {
+  & git @GitArgs 2>&1 | ForEach-Object {
     if (!$Quiet) {
       if ($WriteHostOnError -and $_ -is [System.Management.Automation.ErrorRecord]) { 
         $_ | Out-String | Write-Host -ForegroundColor Red
@@ -45,11 +45,8 @@ function Invoke-Git {
         $_ | Out-String | Write-Host
       }
     }
-    if ($null -ne $_) {
-      if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
-    }
-  })
-
+  }
+  
   $exitCode = $LASTEXITCODE
 
   if ($exitCode -ne 0) {
@@ -156,6 +153,10 @@ function Get-GitPatchText {
       throw "$ErrorMessage`n$($showQuery.Output)"
     }
 
+    if (-not (Test-Path -LiteralPath $patchPath)) {
+      throw $ErrorMessage
+    }
+
     $patchText = [System.IO.File]::ReadAllText($patchPath)
     if ([string]::IsNullOrWhiteSpace($patchText)) {
       throw $ErrorMessage
@@ -175,7 +176,12 @@ function Get-GitRepoRoot {
   [OutputType([string])]
   param()
 
-  return (Invoke-GitQuery -ErrorMessage 'Move-Commit must be run inside a git repository.' rev-parse --show-toplevel).Output.Trim()
+  $repoRoot = (Invoke-GitQuery -ErrorMessage 'Move-Commit must be run inside a git repository.' rev-parse --show-toplevel).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($repoRoot)) {
+    throw "Move-Commit must be run inside a git repository."
+  }
+
+  return $repoRoot
 }
 
 function Get-GitCurrentBranch {
@@ -183,7 +189,12 @@ function Get-GitCurrentBranch {
   [OutputType([string])]
   param()
 
-  return (Invoke-GitQuery -ErrorMessage 'Failed to get current branch.' rev-parse --abbrev-ref HEAD).Output.Trim()
+  $currentBranch = (Invoke-GitQuery -ErrorMessage 'Failed to get current branch.' rev-parse --abbrev-ref HEAD).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($currentBranch)) {
+    throw "Failed to get current branch."
+  }
+
+  return $currentBranch
 }
 
 function Resolve-GitCommit {
@@ -202,7 +213,12 @@ function Resolve-GitCommit {
     $ErrorMessage = "Failed to resolve commit reference '$Ref'."
   }
 
-  return (Invoke-GitQuery -ErrorMessage $ErrorMessage rev-parse --verify "$Ref^{commit}").Output.Trim()
+  $resolvedCommit = (Invoke-GitQuery -ErrorMessage $ErrorMessage rev-parse --verify "$Ref^{commit}").Output.Trim()
+  if ($resolvedCommit -notmatch '^[0-9a-f]{40}$') {
+    throw $ErrorMessage
+  }
+
+  return $resolvedCommit
 }
 
 function Test-GitCheckAttrSupportsSource {
@@ -421,11 +437,13 @@ function ConvertTo-PowerShellStringLiteral {
   [OutputType([string])]
   param(
     [AllowNull()]
-    [AllowEmptyString()]
     [string]$Value
   )
 
-  if ($null -eq $Value) { return "''" }
+  if ($null -eq $Value) {
+    return '$null'
+  }
+
   return "'" + $Value.Replace("'", "''") + "'"
 }
 
@@ -805,6 +823,9 @@ function New-MoveCommitPlan {
     [switch]$RemoveFromSource,
 
     [Parameter()]
+    [switch]$AutoResolveConflicts,
+
+    [Parameter()]
     [switch]$Push,
 
     [Parameter()]
@@ -896,6 +917,7 @@ function New-MoveCommitPlan {
     '$destinationRef = ' + (ConvertTo-PowerShellStringLiteral $destinationRef)
     '$useRemoteTrackingBranch = ' + $(if ($useRemoteTrackingBranch) { '$true' } else { '$false' })
     '$autoStash = ' + $(if ($AutoStash) { '$true' } else { '$false' })
+    '$autoResolveConflicts = ' + $(if ($AutoResolveConflicts) { '$true' } else { '$false' })
     '$pushDestination = ' + $(if ($Push) { '$true' } else { '$false' })
     '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
     '$destWorktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedDestWorktreePath)
@@ -1077,16 +1099,72 @@ function New-MoveCommitPlan {
       )
     }
     else {
-      $executionLines += @(
-        '  & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-        '  if ($LASTEXITCODE -ne 0) {'
-        '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"'
-        '  }'
-        '  $rewrittenHead = (& git -C $sourceWorktreePath rev-parse HEAD).Trim()'
-        '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {'
-        '    throw "Failed to resolve rewritten source head for $expectedBranch."'
-        '  }'
-      )
+      $rebaseOntoLine = '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --onto ' + (ConvertTo-PowerShellStringLiteral $sourceRemovalPlan.ParentHash) + ' $commitHash HEAD 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      if ($AutoResolveConflicts) {
+        $executionLines += @(
+          '  $oldGitEditor = $env:GIT_EDITOR',
+          '  $oldGitSeqEditor = $env:GIT_SEQUENCE_EDITOR',
+          '  $env:GIT_EDITOR = '':''',
+          '  $env:GIT_SEQUENCE_EDITOR = '':''',
+          '  try {',
+          '    $rebaseComplete = $false',
+          '    $rebaseCommitCount = 0',
+          '    $rebaseCountOutput = (& git @longPathGitArgs -C $sourceWorktreePath rev-list --count "$commitHash..HEAD" 2>$null)',
+          '    if ($LASTEXITCODE -eq 0 -and $rebaseCountOutput) {',
+          '      $rebaseCommitCount = [int]($rebaseCountOutput.Trim())',
+          '    }',
+          '    $rebaseMaxRetries = $rebaseCommitCount + 2',
+          '    if ($rebaseMaxRetries -lt 1) { $rebaseMaxRetries = 100 }',
+          '    for ($rebaseRetry = 0; $rebaseRetry -lt $rebaseMaxRetries -and -not $rebaseComplete; $rebaseRetry++) {',
+          '      if ($rebaseRetry -eq 0) {',
+          $rebaseOntoLine,
+          '      }',
+          '      else {',
+          '        & git @longPathGitArgs -C $sourceWorktreePath -c "core.hooksPath=$disabledHooksPath" rebase --continue 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+          '      }',
+          '      if ($LASTEXITCODE -eq 0) {',
+          '        $rebaseComplete = $true',
+          '        break',
+          '      }',
+          '      $addedFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff-tree --diff-filter=A --no-commit-id --name-only -z -r $commitHash 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
+          '      $conflictFiles = @((& git @longPathGitArgs -C $sourceWorktreePath diff --name-only --diff-filter=U -z 2>$null) -join "" -split "`0" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })',
+          '      $resolvedAny = $false',
+          '      foreach ($conflictFile in $conflictFiles) {',
+          '        if ($addedFiles -ccontains $conflictFile) {',
+          '          & git @longPathGitArgs -C $sourceWorktreePath rm -f -- $conflictFile 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }',
+          '          $resolvedAny = $true',
+          '        }',
+          '      }',
+          '      if (-not $resolvedAny) {',
+          '        throw "git -C <source-worktree> rebase --onto failed: unable to auto-resolve (no modify/delete conflict on a file created by the moved commit)"',
+          '      }',
+          '    }',
+          '    if (-not $rebaseComplete) {',
+          '      throw "git -C <source-worktree> rebase did not complete after $rebaseMaxRetries retries while removing $commitHash from $expectedBranch"',
+          '    }',
+          '  }',
+          '  finally {',
+          '    $env:GIT_EDITOR = $oldGitEditor',
+          '    $env:GIT_SEQUENCE_EDITOR = $oldGitSeqEditor',
+          '  }',
+          '  $rewrittenHead = (& git @longPathGitArgs -C $sourceWorktreePath rev-parse HEAD).Trim()',
+          '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {',
+          '    throw "Failed to resolve rewritten source head for $expectedBranch."',
+          '  }'
+        )
+      }
+      else {
+        $executionLines += @(
+          ( '  ' + $rebaseOntoLine.TrimStart()),
+          '  if ($LASTEXITCODE -ne 0) {',
+          '    throw "git -C <source-worktree> rebase --onto failed while removing $commitHash from $expectedBranch"',
+          '  }',
+          '  $rewrittenHead = (& git @longPathGitArgs -C $sourceWorktreePath rev-parse HEAD).Trim()',
+          '  if ($LASTEXITCODE -ne 0 -or $rewrittenHead -notmatch ''^[0-9a-f]{40}$'') {',
+          '    throw "Failed to resolve rewritten source head for $expectedBranch."',
+          '  }'
+        )
+      }
     }
 
     $executionLines += @(
@@ -1226,6 +1304,7 @@ function New-MoveCommitPlan {
     SourceBranch        = $currentBranch
     SourceHead          = $currentHead
     RemoveFromSource    = [bool]$RemoveFromSource
+    AutoResolveConflicts = [bool]$AutoResolveConflicts
     PushDestination     = [bool]$Push
     AutoStash           = [bool]$AutoStash
     OutputScriptCapable = $true
@@ -1456,6 +1535,7 @@ function Split-Hunk {
           '-' { $tmpOld += 1 }
           '+' { $tmpNew += 1 }
           '\\' { }
+          default { $tmpOld += 1; $tmpNew += 1 }
         }
       }
 
@@ -1466,6 +1546,9 @@ function Split-Hunk {
       $original = $body[$targetBodyIndex]
       if ($original.Length -lt 2) {
         throw "Target line for mid-line split is too short to split: '$original'"
+      }
+      if ($targetPrefix -ne ' ' -and $targetPrefix -ne '+') {
+        throw "Mid-line split currently supports only context (' ') or added ('+') lines."
       }
 
       $content = $original.Substring(1)
@@ -1481,12 +1564,9 @@ function Split-Hunk {
       $line2 = "$targetPrefix$right"
 
       # Replace one line with two lines.
-      # Note: $body[0..0] returns a scalar, not a 1-element array. The if statement
-      # also unwraps single-element arrays. So we wrap with @() at the concatenation
-      # point to ensure array addition, not string concatenation.
       $pre = if ($targetBodyIndex -gt 0) { $body[0..($targetBodyIndex - 1)] } else { @() }
       $post = if ($targetBodyIndex -lt ($body.Count - 1)) { $body[($targetBodyIndex + 1)..($body.Count - 1)] } else { @() }
-      $body = @(@($pre) + @($line1, $line2) + @($post))
+      $body = @($pre + @($line1, $line2) + $post)
 
       # The second hunk starts at the inserted second line.
       $splitIndex = $targetBodyIndex + 1
@@ -1516,6 +1596,7 @@ function Split-Hunk {
           '-' { $currentOld += 1 }
           '+' { $currentNew += 1 }
           '\\' { }
+          default { $currentOld += 1; $currentNew += 1 }
         }
       }
     }
@@ -1584,9 +1665,9 @@ function New-Hunk {
   #>
   [CmdletBinding()]
   param(
-    # Start line in the OLD file (the '-' side). 0 for new-file hunks.
+    # 1-based start line in the OLD file (the '-' side).
     [Parameter(Mandatory = $true)]
-    [ValidateRange(0, [int]::MaxValue)]
+    [ValidateRange(1, [int]::MaxValue)]
     [int]$OldStart,
 
     # Number of lines in the OLD file covered by this hunk.
@@ -1594,9 +1675,9 @@ function New-Hunk {
     [ValidateRange(0, [int]::MaxValue)]
     [int]$OldCount,
 
-    # Start line in the NEW file (the '+' side). 0 for deleted-file hunks.
+    # 1-based start line in the NEW file (the '+' side).
     [Parameter(Mandatory = $true)]
-    [ValidateRange(0, [int]::MaxValue)]
+    [ValidateRange(1, [int]::MaxValue)]
     [int]$NewStart,
 
     # Number of lines in the NEW file covered by this hunk.
@@ -1904,6 +1985,9 @@ function Get-GitFileDiffSection {
   $headerMatches = [regex]::Matches($CombinedPatch, '(?m)^diff --git a/(.+?) b/(.+?)$')
   for ($i = 0; $i -lt $headerMatches.Count; $i++) {
     $match = $headerMatches[$i]
+    if (-not $match.Success) {
+      continue
+    }
 
     $oldPath = $match.Groups[1].Value
     $newPath = $match.Groups[2].Value
@@ -2106,6 +2190,7 @@ function Get-GitSplitHunkDescriptors {
   )
 
   $descriptors = New-Object 'System.Collections.Generic.List[object]'
+  $seenHunkIds = New-Object 'System.Collections.Generic.HashSet[string]'
   $globalHunkNumber = 0
 
   foreach ($filePatch in @($FilePatches)) {
@@ -2114,12 +2199,20 @@ function Get-GitSplitHunkDescriptors {
     $pathHunkNumber = 0
 
     foreach ($hunk in @($filePatch.Patches)) {
+      $header = (($hunk -split "`n", 2)[0]).Trim()
+      if ($header -notmatch '^@@ ') {
+        continue
+      }
+
       $metadata = Get-GitSplitHunkHeaderMetadata -Hunk $hunk
       $pathHunkNumber++
       $globalHunkNumber++
 
       $fingerprint = Get-GitSplitHashHex -Text ($Commit + "`n" + $path + "`n" + $hunk.TrimEnd("`r", "`n"))
       $hunkId = 'h' + $fingerprint.Substring(0, 12)
+      if (-not $seenHunkIds.Add($hunkId)) {
+        throw "Encountered duplicate hunk identifier '$hunkId' while enumerating commit $Commit."
+      }
 
       $preview = @(
         ($hunk -split "\r?\n") |
@@ -2163,6 +2256,9 @@ function Get-GitSplitChangedCommitInfo {
   $targetCommit = Resolve-GitCommit -Ref $Ref -ErrorMessage "Unable to resolve Ref '$Ref'."
   $patchText = Get-GitPatchText -Ref $targetCommit -ErrorMessage "git show failed to produce patch for $targetCommit."
   $filePatches = @(Split-Patch -patch $patchText)
+  if (-not $filePatches -or $filePatches.Count -eq 0) {
+    throw "No file patches found in commit $targetCommit."
+  }
 
   return [PSCustomObject]@{
     Commit      = $targetCommit
@@ -2217,8 +2313,14 @@ function Get-GitSplitWorkflowLocalActionPathsFromText {
 
   foreach ($match in $matches) {
     $rawPath = $match.Groups['Path'].Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($rawPath) -or -not $rawPath.StartsWith('./')) {
+      continue
+    }
 
     $repoRelativePath = ConvertTo-GitSplitRepoRelativePath -Path $rawPath.Substring(2)
+    if ([string]::IsNullOrWhiteSpace($repoRelativePath)) {
+      continue
+    }
 
     $candidatePaths = @()
     if ([System.IO.Path]::HasExtension($repoRelativePath)) {
@@ -2551,6 +2653,7 @@ function Get-GitSplitClosure {
               'Selected' { 0 }
               'Included' { 1 }
               'Excluded' { 2 }
+              default { 3 }
             }
           }
         },
@@ -2693,19 +2796,6 @@ function Wait-GitSplitPullRequestChecks {
   return "$Repository#$PullRequest"
 }
 
-function New-HunkGroup {
-  [CmdletBinding()]
-  param(
-    [Parameter()]
-    [AllowEmptyCollection()]
-    [object[]]$Hunks = @()
-  )
-
-  [pscustomobject]@{
-    Hunks = [object[]]$Hunks
-  }
-}
-
 function New-SplitCommitPlan {
   [CmdletBinding()]
   param(
@@ -2718,8 +2808,14 @@ function New-SplitCommitPlan {
   )
 
   $repoRoot = (Invoke-GitQuery -ErrorMessage 'Split-Commit must be run inside a git repository.' rev-parse --show-toplevel).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($repoRoot)) {
+    throw 'Split-Commit must be run inside a git repository.'
+  }
 
   $currentRef = (Invoke-GitQuery -ErrorMessage 'Failed to get current ref.' rev-parse --abbrev-ref HEAD).Output.Trim()
+  if ([string]::IsNullOrWhiteSpace($currentRef)) {
+    throw 'Failed to get current ref.'
+  }
 
   $oldHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Unable to determine HEAD.'
   $target = Resolve-GitCommit -Ref $Ref -ErrorMessage "Unable to resolve Ref '$Ref'."
@@ -2746,23 +2842,22 @@ function New-SplitCommitPlan {
   $patchText = Get-GitPatchText -Ref $target -ErrorMessage "git show failed to produce patch for $target."
 
   $filePatches = Split-Patch -patch $patchText
+  if (-not $filePatches -or $filePatches.Count -eq 0) {
+    throw "No file patches found in commit $target."
+  }
 
   $hunkDescriptors = @(Get-GitSplitHunkDescriptors -Commit $target -FilePatches $filePatches)
   $hunkDescriptorById = @{}
-  $hunkMetadataByPath = @{}
   foreach ($hunkDescriptor in $hunkDescriptors) {
     $hunkDescriptorById[$hunkDescriptor.HunkId] = $hunkDescriptor
-    if (-not $hunkMetadataByPath.ContainsKey($hunkDescriptor.Path)) {
-      $hunkMetadataByPath[$hunkDescriptor.Path] = @()
-    }
-    $hunkMetadataByPath[$hunkDescriptor.Path] += [pscustomobject]@{
-      NewStart = $hunkDescriptor.NewStart
-      NewCount = $hunkDescriptor.NewCount
-    }
   }
 
   $rangesByPath = @{}
   foreach ($range in $NewCommitRanges) {
+    if ($null -eq $range) {
+      continue
+    }
+
     $path = $null
     $resolvedHunkDescriptor = $null
     $hunkId = $null
@@ -2882,17 +2977,22 @@ function New-SplitCommitPlan {
 
       $pieceGroups = @()
       for ($pieceIndex = 1; $pieceIndex -le $maxPiece; $pieceIndex++) {
-        $pieceGroups += New-HunkGroup
+        $pieceGroups += ,@()
       }
 
       for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
         $pieceNumber = if ($pieceByHunkIndex.ContainsKey($hunkIndex)) { [int]$pieceByHunkIndex[$hunkIndex] } else { 1 }
-        $pieceGroups[$pieceNumber - 1] = New-HunkGroup -Hunks ($pieceGroups[$pieceNumber - 1].Hunks + $hunks[$hunkIndex])
+        $pieceGroups[$pieceNumber - 1] = @($pieceGroups[$pieceNumber - 1] + $hunks[$hunkIndex])
+      }
+
+      $pieceGroupsList = New-Object System.Collections.Generic.List[object]
+      for ($pgIndex = 0; $pgIndex -lt $pieceGroups.Count; $pgIndex++) {
+        $pieceGroupsList.Add([object[]]@($pieceGroups[$pgIndex])) | Out-Null
       }
 
       $perFilePieces[$path] = [pscustomobject]@{
         StartPiece  = 1
-        HunkGroups = [object[]]$pieceGroups
+        PieceGroups = $pieceGroupsList.ToArray()
       }
       continue
     }
@@ -2933,21 +3033,20 @@ function New-SplitCommitPlan {
     }
 
     $startPiece = if ($uniquePieceNumbers.Count -gt 0) { [int]$uniquePieceNumbers[0] } else { 1 }
-    $pieceGroups = @()
+    $pieceGroups = New-Object System.Collections.Generic.List[object]
     if ($splitPoints.Count -eq 0) {
-      $pieceGroups += New-HunkGroup -Hunks $hunks
+      $pieceGroups.Add([object[]]@($hunks)) | Out-Null
     }
     else {
-      $pathHunkMetadata = @()
-      if ($hunkMetadataByPath.ContainsKey($path)) {
-        $pathHunkMetadata = $hunkMetadataByPath[$path]
-      }
-
       $targetHunkIndex = $null
       for ($hunkIndex = 0; $hunkIndex -lt $hunks.Count; $hunkIndex++) {
-        $metadata = $pathHunkMetadata[$hunkIndex]
-        $newStart = $metadata.NewStart
-        $newCount = $metadata.NewCount
+        $header = (($hunks[$hunkIndex] -split "`n", 2)[0]).Trim()
+        if ($header -notmatch '^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@') {
+          throw "Hunk does not start with a valid @@ header: $header"
+        }
+
+        $newStart = [int]$matches[3]
+        $newCount = if ($matches[4]) { [int]$matches[4] } else { 1 }
         $newEndExclusive = $newStart + $newCount
 
         $matchingPoints = @($splitPoints | Where-Object {
@@ -2971,6 +3070,10 @@ function New-SplitCommitPlan {
 
       $pieces = @($hunks[$targetHunkIndex])
       foreach ($splitPoint in $splitPoints) {
+        if (-not ($splitPoint.PSObject.Properties.Name -contains 'Line') -or $null -eq $splitPoint.Line -or [string]::IsNullOrWhiteSpace([string]$splitPoint.Line)) {
+          throw "Split-Commit: NewCommitRanges elements must include Line for path '$path'."
+        }
+
         $line = [int]$splitPoint.Line
         $column = if ($splitPoint.PSObject.Properties.Name -contains 'Column' -and $splitPoint.Column) { [int]$splitPoint.Column } else { 1 }
         $splitResult = Split-Hunk -Hunk $pieces[-1] -Line $line -Column $column
@@ -2995,20 +3098,20 @@ function New-SplitCommitPlan {
           $pieceHunks += @($hunks[($targetHunkIndex + 1)..($hunks.Count - 1)])
         }
 
-        $pieceGroups += New-HunkGroup -Hunks $pieceHunks
+        $pieceGroups.Add([object[]]@($pieceHunks)) | Out-Null
       }
     }
 
     $perFilePieces[$path] = [pscustomobject]@{
       StartPiece  = $startPiece
-      HunkGroups = [object[]]$pieceGroups
+      PieceGroups = $pieceGroups.ToArray()
     }
   }
 
   $pieceCount = 1
   foreach ($path in $perFilePieces.Keys) {
     $filePlan = $perFilePieces[$path]
-    $pathPieceCount = $filePlan.StartPiece + @($filePlan.HunkGroups).Count - 1
+    $pathPieceCount = $filePlan.StartPiece + @($filePlan.PieceGroups).Count - 1
     if ($pathPieceCount -gt $pieceCount) {
       $pieceCount = $pathPieceCount
     }
@@ -3021,15 +3124,18 @@ function New-SplitCommitPlan {
       $path = $filePatch.FilePath
       $originalHunks = @($filePatch.Patches)
       $section = Get-GitFileDiffSection -CombinedPatch $patchText -FilePath $path
+      if (-not $section) {
+        throw "Unable to locate diff section for '$path' in commit patch."
+      }
 
       $filePlan = $perFilePieces[$path]
-      $pieceGroups = @($filePlan.HunkGroups)
+      $pieceGroups = @($filePlan.PieceGroups)
       $localPieceIndex = $i - $filePlan.StartPiece
       if ($localPieceIndex -lt 0 -or $localPieceIndex -ge $pieceGroups.Count) {
         continue
       }
 
-      $pieceHunks = @($pieceGroups[$localPieceIndex].Hunks)
+      $pieceHunks = @($pieceGroups[$localPieceIndex])
 
       if ($pieceGroups.Count -eq 1 -and $pieceHunks.Count -eq $originalHunks.Count) {
         # Preserve whole-file assignments byte-for-byte so git apply sees the exact same
@@ -3046,6 +3152,9 @@ function New-SplitCommitPlan {
       }
 
       $hunkStart = $section.IndexOf('@@')
+      if ($hunkStart -lt 0) {
+        throw "Diff section for '$path' did not contain a hunk header."
+      }
 
       $prefix = $section.Substring(0, $hunkStart)
       $prefix = $prefix -replace '(?m)^index .*\r?\n', ''
@@ -3130,6 +3239,9 @@ function New-SplitCommitPlan {
       )
     }
     $variableLines += ')'
+  }
+  else {
+    $variableLines += '$splitPieces = @()'
   }
 
   $steps += New-GitStep -Kind Literal -Lines $variableLines
@@ -3273,8 +3385,6 @@ function Split-Commit {
     - Piece       : alias for PieceNumber
     - Hunk        : alias for HunkId
 
-  Use `New-SplitCommitRange` to build these objects without raw PowerShell object literals.
-
   .PARAMETER OutputScriptPath
   If specified, writes a reviewable PowerShell script with inline split patch artifacts
   instead of executing the rewrite immediately.
@@ -3285,23 +3395,23 @@ function Split-Commit {
 
   .EXAMPLE
   # Split HEAD's b.txt changes so NEW-file line 2 begins a new commit
-  $created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
-    New-SplitCommitRange -Path 'b.txt' -Line 2
+  $created = Split-Commit -Ref HEAD -NewCommitRanges @(
+    [pscustomobject]@{ Path = 'b.txt'; Line = 2 }
   )
   $created
 
   .EXAMPLE
   # Move an entire file diff into the second split commit
-  $created = Split-Commit -Ref 'HEAD~1' -NewCommitRanges @(
-    New-SplitCommitRange -Path 'b.txt' -PieceNumber 2
+  $created = Split-Commit -Ref HEAD~1 -NewCommitRanges @(
+    [pscustomobject]@{ Path = 'b.txt'; PieceNumber = 2 }
   )
   $created
 
   .EXAMPLE
   # Move a specific existing hunk into the second split commit
-  $targetHunk = Get-GitSplitHunks -Ref 'HEAD' | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
-  $created = Split-Commit -Ref 'HEAD' -NewCommitRanges @(
-    New-SplitCommitRange -HunkId $targetHunk.HunkId -PieceNumber 2
+  $targetHunk = Get-GitSplitHunks -Ref HEAD | Where-Object Path -eq 'multi.txt' | Select-Object -Last 1
+  $created = Split-Commit -Ref HEAD -NewCommitRanges @(
+    [pscustomobject]@{ HunkId = $targetHunk.HunkId; PieceNumber = 2 }
   )
   $created
 
@@ -3835,6 +3945,10 @@ function New-GitSplitAbsorbPlan {
         Sort-Object Name |
         ForEach-Object { $_.Name }
     )
+    if ($targetFiles.Count -eq 0) {
+      continue
+    }
+
     $targets += [PSCustomObject]@{
       CommitHash = $targetCommit
       Files      = @($targetFiles)
@@ -3899,6 +4013,9 @@ function Invoke-GitSplitAbsorb {
       Invoke-Git -Quiet -ErrorMessage "Failed to create fixup commit for absorb target '$targetCommit'." -GitArgs $fixupGitArgs
 
       $fixupCommit = (git rev-parse HEAD).Trim()
+      if ($LASTEXITCODE -ne 0 -or $fixupCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Failed to resolve absorb fixup commit for target '$targetCommit'."
+      }
       $createdFixups += $fixupCommit
     }
   }
@@ -3961,6 +4078,10 @@ function New-SetCommitOrderPlan {
     [switch]$Absorb
   )
 
+  if ($OrderedCommits.Count -eq 0) {
+    throw "Provide at least one commit hash to reorder."
+  }
+
   $repoRoot = Get-GitRepoRoot
   $currentBranch = Get-GitCurrentBranch
   if ($currentBranch -eq 'HEAD') {
@@ -3982,6 +4103,9 @@ function New-SetCommitOrderPlan {
 
   $null = Resolve-GitCommit -Ref $BaseRef -ErrorMessage "Base reference '$BaseRef' is not valid."
   $from = (Invoke-GitQuery -ErrorMessage "Failed to determine merge-base between HEAD and '$BaseRef'." merge-base HEAD $BaseRef).Output.Trim()
+  if ($from -notmatch '^[0-9a-f]{40}$') {
+    throw "Failed to determine merge-base between HEAD and '$BaseRef'."
+  }
 
   $resolvedOrderedCommits = @()
   foreach ($orderedCommit in $OrderedCommits) {
@@ -4312,7 +4436,7 @@ function Move-Commit {
 
   .PARAMETER BaseRef
   The base ref to create the destination branch from when -CreateDestinationBranch
-  is specified. Quote refs like '@{upstream}' when invoking from PowerShell.
+  is specified.
 
   .PARAMETER RemoveFromSource
   If specified, removes the commit from the current branch after applying it to the destination.
@@ -4356,6 +4480,9 @@ function Move-Commit {
     [switch]$RemoveFromSource,
 
     [Parameter()]
+    [switch]$AutoResolveConflicts,
+
+    [Parameter()]
     [switch]$Push,
 
     [Parameter()]
@@ -4379,6 +4506,7 @@ function Move-Commit {
     -CommitRef $CommitRef `
     -DestinationBranch $DestinationBranch `
     -RemoveFromSource:$RemoveFromSource `
+    -AutoResolveConflicts:$AutoResolveConflicts `
     -Push:$Push `
     -ForcePushSource:$ForcePushSource `
     -AutoStash:$AutoStash `
