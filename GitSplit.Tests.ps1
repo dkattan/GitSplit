@@ -204,6 +204,7 @@ Import-Module '$escapedManifestPath' -Force
         'Remove-Commit'
         'Select-GitSplitPaths'
         'Set-CommitOrder'
+        'Split-ByPath'
         'Split-Commit'
         'Split-Hunk'
         'Split-Patch'
@@ -5596,6 +5597,366 @@ jobs:
         [PSCustomObject]@{ ExitCode = 128; Output = '' }
       }
       { Test-GitCommitIsAncestor -Ancestor 'abc123' -Descendant 'def456' } | Should -Throw '*Failed to determine*'
+    }
+  }
+
+  Describe "Split-ByPath" {
+    # Helper: read a file's content from a given commit (avoids checkout).
+    function script:Get-FileAtCommit([string]$Commit, [string]$Path) {
+      return (git show "$Commit`:$Path" 2>$null)
+    }
+
+    It "throws when not on a branch (detached HEAD)" {
+      Push-Location $script:TempRepoPath
+      try {
+        $head = (git rev-parse HEAD).Trim()
+        git checkout -q --detach $head
+        try {
+          { Split-ByPath -Path 'a.txt' -DestinationBranch 'dest' -BaseRef 'HEAD~1' } |
+            Should -Throw '*detached HEAD*'
+        }
+        finally {
+          git checkout -q main 2>$null
+        }
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when BaseRef is not an ancestor of HEAD" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Create a parentless (orphan) commit that shares HEAD~1's tree but is NOT in main's history.
+        $orphanTree = (git rev-parse 'HEAD~1^{tree}').Trim()
+        $orphan = (git commit-tree $orphanTree -m 'orphan').Trim()
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'dest' -BaseRef $orphan } |
+          Should -Throw '*not an ancestor of HEAD*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the destination branch already exists" {
+      Push-Location $script:TempRepoPath
+      try {
+        git branch exists-dest | Out-Null
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'exists-dest' -BaseRef 'HEAD~1' } |
+          Should -Throw "*Destination branch 'exists-dest' already exists*"
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when the specified paths did not change in the range" {
+      Push-Location $script:TempRepoPath
+      try {
+        # a.txt was last modified in commit 2 (HEAD~1). b.txt changed in commit 3 (HEAD).
+        # Using BaseRef=HEAD~1, the range HEAD~1..HEAD only changed b.txt, so a.txt is unchanged.
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'dest' -BaseRef 'HEAD~1' } |
+          Should -Throw '*No changes to the specified paths*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws when BaseRef equals HEAD (nothing to split)" {
+      Push-Location $script:TempRepoPath
+      try {
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'dest' -BaseRef 'HEAD' } |
+          Should -Throw '*nothing to split*'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "extracts a path into a stacked destination and removes it from the source (squash, destructive default)" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+        $baseCommit = (git rev-parse HEAD~2).Trim()   # "Add a.txt and b.txt"
+        $baseA = (git show "$baseCommit`:a.txt" 2>$null) -join "`n"
+        $headB = (git show "$originalHead`:b.txt" 2>$null) -join "`n"
+
+        $result = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-stacked' -BaseRef 'HEAD~2'
+        $result | Should -Be 'sbp-stacked'
+
+        # Still on the source branch.
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+
+        # Destination is stacked on the rewritten source tip.
+        $newSourceTip = (git rev-parse $sourceBranch).Trim()
+        (git rev-parse 'sbp-stacked^').Trim() | Should -Be $newSourceTip
+
+        # The destination diff vs the source is exactly the extracted path.
+        (git diff --name-only $sourceBranch 'sbp-stacked') | Should -Be 'a.txt'
+
+        # Source no longer contains a.txt's change (reverted to base), keeps b.txt's change.
+        $sourceA = (git show "$newSourceTip`:a.txt" 2>$null) -join "`n"
+        $sourceA | Should -Be $baseA
+        $sourceB = (git show "$newSourceTip`:b.txt" 2>$null) -join "`n"
+        $sourceB | Should -Be $headB
+
+        # Source collapsed to a single commit on top of the base.
+        (git rev-parse "$sourceBranch^").Trim() | Should -Be $baseCommit
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "extracts a path into a flat destination and leaves the source untouched (squash, copy mode)" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+        $baseCommit = (git rev-parse HEAD~2).Trim()
+
+        $result = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-copy' -BaseRef 'HEAD~2' -RemoveFromSource:$false
+        $result | Should -Be 'sbp-copy'
+
+        # Source is completely untouched.
+        (git rev-parse $sourceBranch).Trim() | Should -Be $originalHead
+        (git rev-parse --abbrev-ref HEAD).Trim() | Should -Be $sourceBranch
+
+        # Flat destination rooted on the base commit.
+        (git rev-parse 'sbp-copy^').Trim() | Should -Be $baseCommit
+        (git diff --name-only $baseCommit 'sbp-copy') | Should -Be 'a.txt'
+
+        # Destination carries a.txt's net change; b.txt stays at base version in the destination.
+        $destB = (git show "sbp-copy`:b.txt" 2>$null) -join "`n"
+        $baseB = (git show "$baseCommit`:b.txt" 2>$null) -join "`n"
+        $destB | Should -Be $baseB
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "extracts a newly-added file onto an explicit destination base (squash, flat)" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Add c.txt, then modify a.txt, so the range has two commits to collapse.
+        'c-line-1' | Set-Content -Path 'c.txt'
+        git add c.txt | Out-Null
+        git commit -m 'Add c.txt' | Out-Null
+
+        'a-line-1' | Set-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'Modify a.txt again' | Out-Null
+
+        $baseCommit = (git rev-parse HEAD~2).Trim()   # before c.txt was added
+        $destBase = (git rev-parse HEAD~3).Trim()     # "Initial" (no c.txt, no a.txt edits from here)
+
+        $result = Split-ByPath -Path 'c.txt' -DestinationBranch 'sbp-flatbase' -BaseRef 'HEAD~2' -DestinationBase $destBase
+        $result | Should -Be 'sbp-flatbase'
+
+        # Destination rooted on the explicit base, carries c.txt as an add.
+        (git rev-parse 'sbp-flatbase^').Trim() | Should -Be $destBase
+        (git diff --name-only $destBase 'sbp-flatbase') | Should -Be 'c.txt'
+        (git show "sbp-flatbase`:c.txt" 2>$null) | Should -Be 'c-line-1'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "extracts a deletion: destination carries the deletion, source restores the file (squash, destructive)" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Add d.txt, then delete it (plus an unrelated a.txt edit) in the range.
+        'd-line-1' | Set-Content -Path 'd.txt'
+        git add d.txt | Out-Null
+        git commit -m 'Add d.txt' | Out-Null
+        $dBase = (git rev-parse HEAD).Trim()
+
+        git rm -q d.txt
+        'a-line-1' | Set-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'Delete d.txt and modify a.txt' | Out-Null
+
+        $result = Split-ByPath -Path 'd.txt' -DestinationBranch 'sbp-delete' -BaseRef $dBase
+        $result | Should -Be 'sbp-delete'
+
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $newSourceTip = (git rev-parse $sourceBranch).Trim()
+
+        # Source restored d.txt.
+        git cat-file -e "$newSourceTip`:d.txt" 2>$null
+        $LASTEXITCODE | Should -Be 0
+        # Destination deleted d.txt.
+        git cat-file -e "sbp-delete`:d.txt" 2>$null
+        $LASTEXITCODE | Should -Not -Be 0
+        # The only difference between source and destination is d.txt.
+        (git diff --name-only $sourceBranch 'sbp-delete') | Should -Be 'd.txt'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "extracts multiple paths together into one destination (squash, destructive)" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+        $baseCommit = (git rev-parse HEAD~2).Trim()
+
+        $result = Split-ByPath -Path 'a.txt','b.txt' -DestinationBranch 'sbp-multi' -BaseRef 'HEAD~2'
+        $result | Should -Be 'sbp-multi'
+
+        $newSourceTip = (git rev-parse $sourceBranch).Trim()
+        # Both paths extracted: source tree == base tree (all changes moved to destination).
+        (git diff --name-only $baseCommit $sourceBranch) | Should -BeNullOrEmpty
+        # Destination diff vs source is exactly both paths.
+        $diffNames = (git diff --name-only $sourceBranch 'sbp-multi') | Sort-Object
+        $diffNames | Should -Be @('a.txt', 'b.txt')
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "can write a reviewable script without executing it" {
+      $scriptPath = $null
+      Push-Location $script:TempRepoPath
+      try {
+        $headCommit = (git rev-parse HEAD).Trim()
+        $baseCommit = (git rev-parse HEAD~2).Trim()
+
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("split-bypath-" + (New-Guid) + ".ps1")
+        $writtenPath = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-scripted' -BaseRef 'HEAD~2' -OutputScriptPath $scriptPath
+        $writtenPath | Should -Be $scriptPath
+        Test-Path $scriptPath | Should -BeTrue
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Match ([regex]::Escape('# Generated by GitSplit: Split-ByPath'))
+        $scriptText | Should -Match ([regex]::Escape("`$expectedHead = '$headCommit'"))
+        $scriptText | Should -Match ([regex]::Escape("`$baseCommit = '$baseCommit'"))
+        $scriptText | Should -Match ([regex]::Escape("`$destinationBranch = 'sbp-scripted'"))
+        # Commit-from-index technique markers.
+        $scriptText | Should -Match ([regex]::Escape('reset --soft $baseCommit'))
+        $scriptText | Should -Match ([regex]::Escape('reset HEAD -- @paths'))
+        # Destructive-by-default review-bot note is present in the source (not the script), but the
+        # script should reflect the destructive rewrite.
+        $scriptText | Should -Match ([regex]::Escape('update-ref "refs/heads/$expectedBranch" $sourceTip'))
+
+        # Nothing executed: destination branch must not exist, HEAD unchanged.
+        (git show-ref --verify --quiet 'refs/heads/sbp-scripted') | Should -BeFalse
+        (git rev-parse HEAD).Trim() | Should -Be $headCommit
+      }
+      finally {
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+          Remove-Item -Path $scriptPath -Force
+        }
+        Pop-Location
+      }
+    }
+
+    It "stashes and restores uncommitted changes when -AutoStash is used" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+
+        # Dirty working tree change to b.txt (which is NOT being extracted).
+        'dirty-b-line' | Add-Content -Path 'b.txt'
+
+        $result = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-stash' -BaseRef 'HEAD~2' -AutoStash
+        $result | Should -Be 'sbp-stash'
+
+        # The dirty change was restored.
+        (Get-Content -Path 'b.txt' -Tail 1) | Should -Be 'dirty-b-line'
+        # And the split happened.
+        (git diff --name-only $sourceBranch 'sbp-stash') | Should -Be 'a.txt'
+        # No stash left behind.
+        (git stash list) | Should -BeNullOrEmpty
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "refuses to run with a dirty working tree when -AutoStash is not set" {
+      Push-Location $script:TempRepoPath
+      try {
+        'dirty-line' | Add-Content -Path 'b.txt'
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-noautostash' -BaseRef 'HEAD~2' } |
+          Should -Throw '*Uncommitted changes detected*'
+        # Destination not created.
+        (git show-ref --verify --quiet 'refs/heads/sbp-noautostash') | Should -BeFalse
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    Context "preserve mode (-Squash:`$false, git-filter-repo)" {
+      BeforeEach {
+        $script:FilterRepoAvailable = $null -ne (Get-Command git-filter-repo -ErrorAction SilentlyContinue)
+      }
+
+      It "rewrites the source keeping commit structure minus the extracted paths (destructive)" {
+        if (-not $script:FilterRepoAvailable) {
+          Set-ItResult -Skipped -Because "git-filter-repo is not installed; preserve mode requires it."
+        }
+        Push-Location $script:TempRepoPath
+        try {
+          $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+          $originalHead = (git rev-parse HEAD).Trim()
+          $baseCommit = (git rev-parse HEAD~2).Trim()
+          # NOTE: the ".." revision range MUST be quoted -- unquoted, PowerShell parses it as its range
+          # operator between the sha and the bareword HEAD, mangling the argument.
+          $originalCommitCount = [int](git rev-list --count "$baseCommit..HEAD").Trim()
+
+          $result = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-preserve' -BaseRef 'HEAD~2' -Squash:$false
+          $result | Should -Be 'sbp-preserve'
+
+          $newSourceTip = (git rev-parse $sourceBranch).Trim()
+          # filter-repo rewrites the whole history (it strips a.txt from every commit, including the
+          # base), so the old $baseCommit SHA is no longer an ancestor of the rewritten tip. Resolve the
+          # REWRITTEN base from the new tip and compare within the rewritten history.
+          $newSourceTip | Should -Not -Be $originalHead
+          $rewrittenBase = (git rev-parse "$newSourceTip~$originalCommitCount").Trim()
+          # filter-repo preserves commit structure (no squash): the in-range commit count is unchanged.
+          $newCommitCount = [int](git rev-list --count "$rewrittenBase..$newSourceTip").Trim()
+          $newCommitCount | Should -Be $originalCommitCount
+          # a.txt change excised from the source range (rewritten-base .. rewritten-tip).
+          (git diff --name-only $rewrittenBase $newSourceTip) | Should -Not -Contain 'a.txt'
+          # Destination is stacked on the rewritten source and carries a.txt.
+          (git rev-parse 'sbp-preserve^').Trim() | Should -Be $newSourceTip
+          (git diff --name-only $newSourceTip 'sbp-preserve') | Should -Be 'a.txt'
+        }
+        finally {
+          Pop-Location
+        }
+      }
+
+      It "leaves the source untouched in copy mode (preserve)" {
+        if (-not $script:FilterRepoAvailable) {
+          Set-ItResult -Skipped -Because "git-filter-repo is not installed; preserve mode requires it."
+        }
+        Push-Location $script:TempRepoPath
+        try {
+          $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+          $originalHead = (git rev-parse HEAD).Trim()
+
+          $result = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-preserve-copy' -BaseRef 'HEAD~2' -Squash:$false -RemoveFromSource:$false
+          $result | Should -Be 'sbp-preserve-copy'
+
+          (git rev-parse $sourceBranch).Trim() | Should -Be $originalHead
+          $baseCommit = (git rev-parse HEAD~2).Trim()
+          (git diff --name-only $baseCommit 'sbp-preserve-copy') | Should -Be 'a.txt'
+        }
+        finally {
+          Pop-Location
+        }
+      }
     }
   }
 }
