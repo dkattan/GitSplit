@@ -24,6 +24,7 @@
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
+    'Split-ByPath'
     'Set-CommitOrder'
     'Invoke-GitSplitAbsorb'
     'Get-CommitMessageFromChanges'
