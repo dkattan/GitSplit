@@ -760,6 +760,614 @@ function Invoke-GitPlan {
   return & $scriptBlock
 }
 
+# ---------------------------------------------------------------------------
+# Pipeline recorder (plan core)
+#
+# A newer plan model used by Move-Commit -UnderPRInStack. Unlike the existing
+# New-GitStep/New-GitPlan model (which stores PowerShell as string literals and
+# compiles them to a scriptblock for execution), the recorder stores operations
+# as DATA nodes with two interpreters that walk the same nodes:
+#   - Invoke-Pipeline          : live execution (dispatches to git/gh/stack seams)
+#   - ConvertTo-PipelineScript : serializes nodes to a reviewable .ps1
+# Strings are an OUTPUT of serialization, never an INPUT to the builder. Each op
+# may carry a Down (undo) companion for the rollback buffer, a When condition,
+# and an OnFailure handler. There is intentionally no general control-flow DSL:
+# only per-op OnFailure, a single pipeline-level finally, and When guards.
+#
+# This is additive: the existing New-GitStep/New-GitPlan model is untouched.
+# ---------------------------------------------------------------------------
+
+function New-PipelineOp {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Git', 'Gh', 'Stack', 'Api', 'Script')]
+    [string]$Kind,
+
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [string[]]$Args,
+
+    [Parameter()]
+    [string]$WorkingDir,
+
+    [Parameter()]
+    [AllowEmptyCollection()]
+    [object[]]$OnFailure,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label,
+
+    [Parameter()]
+    [hashtable]$CaptureResult,
+
+    # For Kind='Script': a literal PowerShell body (multi-line) executed/serialized as-is.
+    # Used for steps that are a few lines of logic (e.g. patch-id skip check, worktree
+    # detection) rather than a single command. Keeps the DSL narrow: one new kind, not a
+    # general control-flow AST.
+    [Parameter()]
+    [string]$ScriptBody
+  )
+
+  return [pscustomobject]@{
+    Kind          = $Kind
+    Args          = @($Args)
+    WorkingDir    = $WorkingDir
+    OnFailure     = if ($null -ne $OnFailure -and $OnFailure.Count -gt 0) { @($OnFailure) } else { $null }
+    Down          = $Down
+    When          = $When
+    Label         = $Label
+    CaptureResult = $CaptureResult
+    ScriptBody    = $ScriptBody
+  }
+}
+
+function New-Pipeline {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Name = 'Pipeline',
+
+    [Parameter()]
+    [hashtable]$Metadata,
+
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [object[]]$Steps
+  )
+
+  return [pscustomobject]@{
+    Name     = $Name
+    Metadata = if ($Metadata) { $Metadata } else { @{} }
+    Steps    = @($Steps)
+    Finally  = $null
+  }
+}
+
+function Add-PipelineOp {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true)]
+    [object]$Op
+  )
+
+  $Pipeline.Steps = @($Pipeline.Steps) + $Op
+  return $Pipeline
+}
+
+function Set-PipelineFinally {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [object[]]$Ops
+  )
+
+  $Pipeline.Finally = @($Ops)
+}
+
+# --- Builder functions: append op nodes, do NOT execute. ---
+
+function Invoke-GitOp {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args,
+
+    [Parameter()]
+    [string]$WorkingDir,
+
+    [Parameter()]
+    [object[]]$OnFailure,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label,
+
+    [Parameter()]
+    [hashtable]$CaptureResult
+  )
+
+  $op = New-PipelineOp -Kind 'Git' -Args $Args -WorkingDir $WorkingDir -OnFailure $OnFailure -Down $Down -When $When -Label $Label -CaptureResult $CaptureResult
+  return Add-PipelineOp -Pipeline $Pipeline -Op $op
+}
+
+function Invoke-GhOp {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args,
+
+    [Parameter()]
+    [string]$WorkingDir,
+
+    [Parameter()]
+    [object[]]$OnFailure,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label,
+
+    [Parameter()]
+    [hashtable]$CaptureResult
+  )
+
+  $op = New-PipelineOp -Kind 'Gh' -Args $Args -WorkingDir $WorkingDir -OnFailure $OnFailure -Down $Down -When $When -Label $Label -CaptureResult $CaptureResult
+  return Add-PipelineOp -Pipeline $Pipeline -Op $op
+}
+
+function Invoke-StackOp {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args,
+
+    [Parameter()]
+    [string]$WorkingDir,
+
+    [Parameter()]
+    [object[]]$OnFailure,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label,
+
+    [Parameter()]
+    [hashtable]$CaptureResult
+  )
+
+  $op = New-PipelineOp -Kind 'Stack' -Args $Args -WorkingDir $WorkingDir -OnFailure $OnFailure -Down $Down -When $When -Label $Label -CaptureResult $CaptureResult
+  return Add-PipelineOp -Pipeline $Pipeline -Op $op
+}
+
+function Invoke-GhApiOp {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args,
+
+    [Parameter()]
+    [string]$WorkingDir,
+
+    [Parameter()]
+    [object[]]$OnFailure,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label,
+
+    [Parameter()]
+    [hashtable]$CaptureResult
+  )
+
+  $op = New-PipelineOp -Kind 'Api' -Args $Args -WorkingDir $WorkingDir -OnFailure $OnFailure -Down $Down -When $When -Label $Label -CaptureResult $CaptureResult
+  return Add-PipelineOp -Pipeline $Pipeline -Op $op
+}
+
+function Add-PipelineScriptOp {
+  <#
+  .SYNOPSIS
+  Builder for a literal-PowerShell op (Kind='Script'). Appends, does not execute.
+  Used for steps that are a few lines of logic (patch-id skip, worktree detection)
+  rather than a single command.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ScriptBody,
+
+    [Parameter()]
+    [object]$Down,
+
+    [Parameter()]
+    [string]$When,
+
+    [Parameter()]
+    [string]$Label
+  )
+
+  $op = New-PipelineOp -Kind 'Script' -Args @() -ScriptBody $ScriptBody -Down $Down -When $When -Label $Label
+  return Add-PipelineOp -Pipeline $Pipeline -Op $op
+}
+
+# --- Internal helpers for the interpreters ---
+
+function Expand-PipelineRuntimeTokens {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyCollection()]
+    [string[]]$Args,
+
+    [Parameter(Mandatory = $true)]
+    [hashtable]$RuntimeVars
+  )
+
+  $expanded = @()
+  foreach ($arg in $Args) {
+    if ($arg -is [string] -and $arg -match '^\$runtime:(.+)$') {
+      $varName = $Matches[1]
+      if ($RuntimeVars.ContainsKey($varName)) {
+        $expanded += [string]$RuntimeVars[$varName]
+      }
+      else {
+        $expanded += $arg
+      }
+    }
+    else {
+      $expanded += $arg
+    }
+  }
+  return [string[]]$expanded
+}
+
+function Invoke-PipelineOpLive {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Op,
+
+    [Parameter(Mandatory = $true)]
+    [hashtable]$RuntimeVars
+  )
+
+  $expandedArgs = Expand-PipelineRuntimeTokens -Args $Op.Args -RuntimeVars $RuntimeVars
+
+  $result = switch ($Op.Kind) {
+    'Git' {
+      $gitArgs = @($expandedArgs)
+      if ($Op.WorkingDir) { $gitArgs = @('-C', $Op.WorkingDir) + $gitArgs }
+      Invoke-GitQuery -AllowFailure -GitArgs $gitArgs
+    }
+    'Gh' {
+      Invoke-GhCommand -AllowFailure -Args $expandedArgs
+    }
+    'Stack' {
+      Invoke-StackCommand -AllowFailure -Args $expandedArgs
+    }
+    'Api' {
+      Invoke-GhApi -AllowFailure -Args $expandedArgs
+    }
+    'Script' {
+      # Execute the literal PowerShell body. The body is expected to set $LASTEXITCODE
+      # (default 0) if it shells out; a thrown terminating error propagates as failure.
+      $scriptResult = & ([scriptblock]::Create($Op.ScriptBody))
+      [pscustomobject]@{
+        ExitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+        Output   = if ($scriptResult) { "$scriptResult" } else { '' }
+        Lines    = @()
+      }
+    }
+  }
+
+  # Capture results (e.g. PR number from `gh pr create` output) into runtime vars.
+  if ($Op.CaptureResult -and $result.ExitCode -eq 0) {
+    $captureType = $Op.CaptureResult.Type
+    $varName = $Op.CaptureResult.Variable
+    $captured = $null
+    if ($captureType -eq 'PRNumber') {
+      # gh pr create prints a URL ending in /pull/<number>; fall back to a bare number.
+      if ($result.Output -match '/pull/(\d+)') {
+        $captured = $Matches[1]
+      }
+      elseif ($result.Output -match '^\s*(\d+)\s*$') {
+        $captured = $Matches[1]
+      }
+    }
+    if ($null -ne $captured) {
+      $RuntimeVars[$varName] = $captured
+    }
+  }
+
+  return $result
+}
+
+function Invoke-Pipeline {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter()]
+    [switch]$DryRun
+  )
+
+  $runtimeVars = @{}
+  $executedDowns = [System.Collections.ArrayList]@()
+  $completedSteps = [System.Collections.ArrayList]@()
+  $success = $true
+  $firstError = $null
+
+  foreach ($op in $Pipeline.Steps) {
+    # Evaluate the When guard; false => skip.
+    if ($op.When) {
+      $cond = [scriptblock]::Create($op.When)
+      $guardResult = & $cond
+      if (-not $guardResult) { continue }
+    }
+
+    $result = Invoke-PipelineOpLive -Op $op -RuntimeVars $runtimeVars
+
+    if ($result.ExitCode -ne 0) {
+      $success = $success -band $false
+      if (-not $firstError) { $firstError = $result }
+
+      # Fire OnFailure handlers.
+      if ($op.OnFailure) {
+        foreach ($failureOp in $op.OnFailure) {
+          Invoke-PipelineOpLive -Op $failureOp -RuntimeVars $runtimeVars | Out-Null
+        }
+      }
+
+      # Record the Down companion for possible rollback.
+      if ($op.Down) {
+        $null = $executedDowns.Insert(0, $op.Down)
+      }
+
+      break
+    }
+
+    $null = $completedSteps.Add($op)
+    if ($op.Down) {
+      $null = $executedDowns.Insert(0, $op.Down)
+    }
+  }
+
+  # Run the single pipeline-level finally.
+  if ($Pipeline.Finally) {
+    foreach ($finalOp in $Pipeline.Finally) {
+      try {
+        Invoke-PipelineOpLive -Op $finalOp -RuntimeVars $runtimeVars | Out-Null
+      }
+      catch {
+        # finally failures must not mask the primary result.
+        Write-Warning "Pipeline finally step failed: $($_.Exception.Message)"
+      }
+    }
+  }
+
+  return [pscustomobject]@{
+    Success        = [bool]$success
+    FirstError     = $firstError
+    CompletedSteps = $completedSteps.ToArray()
+    DownCommands   = $executedDowns.ToArray()
+    RuntimeVars    = $runtimeVars
+  }
+}
+
+function ConvertTo-PipelineOpScript {
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Op,
+
+    [Parameter()]
+    [int]$Indent
+  )
+
+  $pad = ('  ' * $Indent)
+  $lines = @()
+
+  # Script ops emit a literal PowerShell body verbatim (indented), plus a Down comment.
+  if ($Op.Kind -eq 'Script') {
+    if ($Op.When) {
+      $lines += $pad + 'if (' + $Op.When + ') {'
+      $bodyPad = $pad + '  '
+    }
+    else {
+      $bodyPad = $pad
+    }
+    foreach ($bodyLine in ($Op.ScriptBody -split "`n")) {
+      $lines += $bodyPad + $bodyLine
+    }
+    if ($Op.When) {
+      $lines += $pad + '}'
+    }
+    if ($Op.Down) {
+      $lines += $pad + '# Rollback (Down): ' + $Op.Down.ScriptBody
+    }
+    return [string[]]$lines
+  }
+
+  $runner = switch ($Op.Kind) {
+    'Git'   { 'git' }
+    'Gh'    { 'gh' }
+    'Stack' { 'gh stack' }
+    'Api'   { 'gh api' }
+  }
+
+  # Emit the When guard.
+  $bodyLines = @()
+  $argLiterals = @()
+  foreach ($a in $Op.Args) {
+    $argLiterals += (ConvertTo-PowerShellStringLiteral "$a")
+  }
+
+  $cmdLine = ''
+  if ($Op.WorkingDir) {
+    $cmdLine += 'git -C ' + (ConvertTo-PowerShellStringLiteral $Op.WorkingDir) + ' '  # only Git uses WorkingDir today
+  }
+  $cmdLine += $runner + ' ' + ($argLiterals -join ' ')
+
+  if ($Op.When) {
+    $lines += $pad + 'if (' + $Op.When + ') {'
+    $bodyLines += $pad + '  & ' + $cmdLine
+  }
+  else {
+    $bodyLines += $pad + '& ' + $cmdLine
+  }
+
+  $lines += $bodyLines
+
+  if ($Op.When) {
+    $lines += $pad + '}'
+  }
+
+  # Document the Down (undo) companion as a rollback comment.
+  if ($Op.Down) {
+    $downLiterals = @()
+    foreach ($a in $Op.Down.Args) {
+      $downLiterals += (ConvertTo-PowerShellStringLiteral "$a")
+    }
+    $downRunner = switch ($Op.Down.Kind) {
+      'Git'   { 'git' }
+      'Gh'    { 'gh' }
+      'Stack' { 'gh stack' }
+      'Api'   { 'gh api' }
+    }
+    $lines += $pad + '# Rollback (Down): ' + $downRunner + ' ' + ($downLiterals -join ' ')
+  }
+
+  return [string[]]$lines
+}
+
+function ConvertTo-PipelineScript {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline
+  )
+
+  $lines = @(
+    '# Generated by GitSplit: ' + $Pipeline.Name
+    'Set-StrictMode -Version Latest'
+    "$ErrorActionPreference = 'Stop'"
+    ''
+  )
+
+  if ($Pipeline.Metadata -and $Pipeline.Metadata.Count -gt 0) {
+    $lines += '# Frozen discovery metadata:'
+    foreach ($key in $Pipeline.Metadata.Keys) {
+      $val = $Pipeline.Metadata[$key]
+      $literal = if ($null -eq $val) { '$null' }
+      elseif ($val -is [bool]) { if ($val) { '$true' } else { '$false' } }
+      else { (ConvertTo-PowerShellStringLiteral "$val") }
+      $lines += '# ' + $key + ' = ' + $literal
+    }
+    $lines += ''
+  }
+
+  $lines += '# Pipeline steps:'
+  foreach ($op in $Pipeline.Steps) {
+    if ($op.Label) {
+      $lines += '# ' + $op.Label
+    }
+    $lines += ConvertTo-PipelineOpScript -Op $op -Indent 0
+  }
+
+  if ($Pipeline.Finally) {
+    $lines += ''
+    $lines += '# finally:'
+    $lines += 'try {'
+    foreach ($finalOp in $Pipeline.Finally) {
+      $lines += ConvertTo-PipelineOpScript -Op $finalOp -Indent 1
+    }
+    $lines += '}'
+    $lines += 'catch {'
+    $lines += '  Write-Warning "Pipeline finally step failed: $($_.Exception.Message)"'
+    $lines += '}'
+  }
+
+  return (($lines -join "`n").TrimEnd()) + "`n"
+}
+
+function Write-PipelineScript {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [pscustomobject]$Pipeline,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Path
+  )
+
+  $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+  $parentPath = Split-Path -Parent $resolvedPath
+  if (-not [string]::IsNullOrWhiteSpace($parentPath) -and -not (Test-Path -LiteralPath $parentPath)) {
+    New-Item -Path $parentPath -ItemType Directory -Force | Out-Null
+  }
+
+  Set-Content -Path $resolvedPath -Value (ConvertTo-PipelineScript -Pipeline $Pipeline)
+  return $resolvedPath
+}
+
 function New-CommitRemovalRewritePlan {
   [CmdletBinding()]
   param(
@@ -1331,6 +1939,241 @@ function New-MoveCommitPlan {
     AutoStash           = [bool]$AutoStash
     OutputScriptCapable = $true
   } -Steps $steps
+}
+
+function New-MoveCommitUnderPRPlan {
+  <#
+  .SYNOPSIS
+  Builds a recorder pipeline that stacks a commit UNDER an existing PR.
+
+  .DESCRIPTION
+  Cherry-picks a commit onto a new lower branch (in a persistent, user-owned
+  worktree), pushes it, opens a draft PR, repoints the source PR's base to the
+  lower branch, and registers the GitHub-native stack. Non-destructive by
+  default: the source branch is never rewritten or force-pushed (the moved
+  commit leaves the source PR's diff because the diff becomes lower..source).
+
+  Lower branch base = the source PR's current base (derived), so the lower
+  branch slots under the source PR at the same depth.
+
+  Idempotent re-run is the primary recovery model: pre-flight checks and
+  per-step resume checks are one mechanism used twice. Each op carries a Down
+  (undo) companion for the rollback buffer.
+
+  See the design memory (gitsplit-under-pr-stack-design.md) for the 9 decisions.
+  #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$WorktreePath,
+
+    [Parameter()]
+    [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
+    [string]$CommitRef = "HEAD",
+
+    [Parameter()]
+    [int]$SourcePR,
+
+    [Parameter()]
+    [ValidateSet('gh-stack', 'graphite', 'none', 'auto')]
+    [string]$StackProvider = 'auto',
+
+    [Parameter()]
+    [ValidateSet('draft', 'ready')]
+    [string]$DraftState = 'draft',
+
+    [Parameter()]
+    [string]$Title,
+
+    [Parameter()]
+    [string]$Body,
+
+    [Parameter()]
+    [switch]$RollbackOnFailure,
+
+    [Parameter()]
+    [switch]$DryRun
+  )
+
+  # -------------------------------------------------------------------------
+  # Discovery (read-only; values frozen into Metadata).
+  # -------------------------------------------------------------------------
+  $repoRoot = Get-GitRepoRoot
+  $sourceBranch = Get-GitCurrentBranch
+  if ($sourceBranch -eq 'HEAD') {
+    throw "You are in a detached HEAD state. Checkout a branch before calling Move-Commit -UnderPRInStack."
+  }
+
+  $commitHash = Resolve-GitCommit -Ref $CommitRef -ErrorMessage "Failed to resolve commit reference '$CommitRef'."
+
+  # Derive the lower branch name from the commit subject (slugged), ensuring uniqueness is not required
+  # because the flow reuses an existing lower branch on idempotent re-run.
+  $commitSubject = (Invoke-GitQuery -GitArgs @('log', '-1', '--format=%s', $commitHash)).Output
+  $lowerBranch = 'under/' + ($commitSubject -replace '[^A-Za-z0-9._-]+', '-' -replace '^-+|-+$', '')
+  if ([string]::IsNullOrWhiteSpace($lowerBranch) -or $lowerBranch -eq 'under/') {
+    $lowerBranch = 'under/' + $commitHash.Substring(0, 7)
+  }
+
+  # Resolve the source PR (derive from branch, or use -SourcePR).
+  $sourcePRNumber = 0
+  $sourcePRBaseRef = $null
+  # NOTE: use $sourcePRObject (not $sourcePR) — PowerShell variables are case-insensitive,
+  # so $sourcePR would collide with the $SourcePR parameter and trigger an int coercion error.
+  if ($SourcePR -gt 0) {
+    $sourcePRNumber = $SourcePR
+    $prJson = (Invoke-GhCommand -Args @('pr', 'view', "$SourcePR", '--json', 'number,baseRefName,headRefName,isDraft,state')).Output
+    $sourcePRObject = $prJson | ConvertFrom-Json
+    $sourcePRBaseRef = $sourcePRObject.baseRefName
+  }
+  else {
+    $sourcePRObject = Resolve-GitSplitPullRequestFromBranch -Branch $sourceBranch
+    if ($null -eq $sourcePRObject) {
+      throw "No open pull request found for branch '$sourceBranch'. Move-Commit -UnderPRInStack requires the source branch to have an open PR to stack under."
+    }
+    $sourcePRNumber = [int]$sourcePRObject.number
+    $sourcePRBaseRef = $sourcePRObject.baseRefName
+  }
+  if ($sourcePRObject.state -and $sourcePRObject.state -ne 'OPEN') {
+    throw "Source PR #$sourcePRNumber is not open (state='$($sourcePRObject.state)'). -UnderPRInStack requires an open source PR."
+  }
+  $lowerBaseRef = $sourcePRBaseRef
+
+  # Title/body: derive from the commit message unless overridden.
+  if ([string]::IsNullOrWhiteSpace($Title)) {
+    $Title = $commitSubject
+  }
+  if ([string]::IsNullOrWhiteSpace($Body)) {
+    $Body = (Invoke-GitQuery -GitArgs @('log', '-1', '--format=%b', $commitHash)).Output
+  }
+
+  # Provider + stale stacks (discovery-time D5: record unstack ops straight-line).
+  $provider = New-GitStackProvider -Provider $StackProvider
+  $staleStacks = @()
+  try {
+    $staleStacks = Find-GitSplitStaleStacks -SourcePRNumber $sourcePRNumber
+  }
+  catch {
+    # Stale-stack discovery is best-effort; if the stacks API is unavailable we proceed
+    # and let the reactive repoint handle a stack-block at runtime.
+    $staleStacks = @()
+  }
+
+  # -------------------------------------------------------------------------
+  # Pre-flight (fail-fast, before any mutation).
+  # -------------------------------------------------------------------------
+  $remoteLowerExists = Test-GitRefExists -Ref "refs/remotes/origin/$lowerBranch"
+  if ($remoteLowerExists) {
+    throw "Precondition failed: lower branch '$lowerBranch' already exists on origin. If this is an idempotent re-run, the flow will resume; otherwise delete it first (git push -d origin $lowerBranch)."
+  }
+
+  $existingLowerPR = Resolve-GitSplitPullRequestFromBranch -Branch $lowerBranch
+  if ($null -ne $existingLowerPR) {
+    throw "Precondition failed: a PR already exists for lower branch '$lowerBranch'. If this is an idempotent re-run, the flow will resume; otherwise close it first."
+  }
+
+  # -------------------------------------------------------------------------
+  # Build (record ops; builders append, do not execute).
+  # -------------------------------------------------------------------------
+  $pipeline = New-Pipeline -Name 'Move-Commit-UnderPRInStack' -Metadata @{
+    SourceBranch     = $sourceBranch
+    CommitHash       = $commitHash
+    LowerBranch      = $lowerBranch
+    LowerBaseRef     = $lowerBaseRef
+    WorktreePath     = $WorktreePath
+    SourcePRNumber   = $sourcePRNumber
+    DraftState       = $DraftState
+    Title            = $Title
+    StackProvider    = $provider.Provider
+  } -Steps @()
+
+  $worktreeLit = (ConvertTo-PowerShellStringLiteral $WorktreePath)
+  $lowerBranchLit = (ConvertTo-PowerShellStringLiteral $lowerBranch)
+  $lowerBaseLit = (ConvertTo-PowerShellStringLiteral $lowerBaseRef)
+  $commitHashLit = (ConvertTo-PowerShellStringLiteral $commitHash)
+  $titleLit = (ConvertTo-PowerShellStringLiteral $Title)
+  $bodyLit = (ConvertTo-PowerShellStringLiteral $Body)
+  $sourcePRLit = (ConvertTo-PowerShellStringLiteral "$sourcePRNumber")
+
+  # --- Step 0: 3-way worktree detect-and-branch (D6) ---
+  # A Script op: if the path is not yet a worktree on $lowerBranch, create it.
+  # If it already is (re-run resume), enter it. Either way, end on $lowerBranch at $WorktreePath.
+  $worktreeScript = @"
+`$wtPath = $worktreeLit
+`$lowerBranch = $lowerBranchLit
+`$baseRef = $lowerBaseLit
+`$existingWt = @(& git worktree list --porcelain) -join "`n"
+if (`$existingWt -notmatch [regex]::Escape((Resolve-Path `$wtPath).Path)) {
+  if (Test-Path -LiteralPath `$wtPath) {
+    `$children = @(Get-ChildItem -LiteralPath `$wtPath -Force)
+    if (`$children.Count -gt 0) {
+      throw "WorktreePath '`$wtPath' exists and is not empty and not a worktree on '`$lowerBranch'."
+    }
+  }
+  & git worktree add -b `$lowerBranch `$wtPath `$baseRef
+  if (`$LASTEXITCODE -ne 0) { throw "git worktree add -b `$lowerBranch failed" }
+}
+"@
+  Add-PipelineScriptOp -Pipeline $pipeline -ScriptBody $worktreeScript -Label 'worktree: add-or-enter (D6 3-way)' | Out-Null
+
+  # --- Step 1: cherry-pick with patch-id skip (D8 idempotency) ---
+  # A Script op: skip the cherry-pick if the moved commit's patch is already on $lowerBranch.
+  $cherryPickScript = @"
+`$wtPath = $worktreeLit
+`$commitHash = $commitHashLit
+`$targetPid = (& git diff "`$commitHash^" "`$commitHash" | & git patch-id --stable | ForEach-Object { (`$_ -split '\s+')[0] } | Select-Object -First 1)
+`$alreadyApplied = `$false
+if (`$targetPid) {
+  `$found = (& git -C `$wtPath log -p | & git patch-id --stable | Where-Object { (`$_ -split '\s+')[0] -eq `$targetPid } | Select-Object -First 1)
+  if (`$found) { `$alreadyApplied = `$true }
+}
+if (-not `$alreadyApplied) {
+  & git -C `$wtPath cherry-pick `$commitHash
+  if (`$LASTEXITCODE -ne 0) {
+    Write-Warning "Cherry-pick conflicted in worktree '`$wtPath'. Resolve there, then re-run Move-Commit -UnderPRInStack to resume."
+    throw "cherry-pick of `$commitHash conflicted; worktree preserved at '`$wtPath'"
+  }
+}
+"@
+  $cherryPickDown = New-PipelineOp -Kind 'Git' -Args @('-C', '$runtime:worktreePath', 'reset', '--hard', '$runtime:lowerBaseCommit')
+  Add-PipelineScriptOp -Pipeline $pipeline -ScriptBody $cherryPickScript -Down $cherryPickDown -Label 'cherry-pick (patch-id skip, D8)' | Out-Null
+
+  # --- Step 2: push lower branch (Down: git push -d) ---
+  $pushDown = New-PipelineOp -Kind 'Git' -Args @('push', '-d', 'origin', $lowerBranch)
+  Invoke-GitOp -Pipeline $pipeline -Args @('push', '-u', 'origin', $lowerBranch) -Down $pushDown -Label 'push lower' | Out-Null
+
+  # --- Step 3: create lower draft PR (Down: gh pr close <#>); capture the PR number ---
+  $draftArg = if ($DraftState -eq 'draft') { @('--draft') } else { @() }
+  $createArgs = @('pr', 'create', '--base', $lowerBaseRef, '--head', $lowerBranch, '--title', $Title) + $draftArg
+  if (-not [string]::IsNullOrWhiteSpace($Body)) { $createArgs += @('--body', $Body) }
+  $closeDown = New-PipelineOp -Kind 'Gh' -Args @('pr', 'close', '$runtime:lowerPRNumber')
+  Invoke-GhOp -Pipeline $pipeline -Args $createArgs -Down $closeDown -CaptureResult @{ Type = 'PRNumber'; Variable = 'lowerPRNumber' } -Label 'create lower PR (capture number)' | Out-Null
+
+  # --- Step 4: D5 stale-stack unstack (discovery-time, straight-line) then repoint source base ---
+  foreach ($stackNum in $staleStacks) {
+    $unstackDown = $null
+    Invoke-StackOp -Pipeline $pipeline -Args @('unstack', "$stackNum") -Label "unstack stale stack $stackNum (D5)" | Out-Null
+  }
+  $repointDown = New-PipelineOp -Kind 'Gh' -Args @('pr', 'edit', "$sourcePRNumber", '--base', $lowerBaseRef)
+  Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'edit', "$sourcePRNumber", '--base', $lowerBranch) -Down $repointDown -Label 'repoint source PR base -> lower' | Out-Null
+
+  # --- Step 5: register the stack (D4 provider) ---
+  # gh-stack: `gh stack link <lower-pr> <source-pr>` (PR numbers). none: no-op. graphite: gt submit.
+  if ($provider.Provider -eq 'gh-stack') {
+    $linkDown = New-PipelineOp -Kind 'Stack' -Args @('unstack', '$runtime:stackNumber')
+    Invoke-StackOp -Pipeline $pipeline -Args @('link', '$runtime:lowerPRNumber', "$sourcePRNumber") -Down $linkDown -Label 'gh stack link (register)' | Out-Null
+  }
+  elseif ($provider.Provider -eq 'graphite') {
+    Invoke-GhOp -Pipeline $pipeline -Args @('submit', '--stack', '--no-interactive') -Label 'gt submit (register)' | Out-Null
+  }
+  # 'none': no registration op.
+
+  # --- finally: persistent worktree — NEVER removed (D6 inversion). ---
+  # The only finally concern would be stash restoration; the worktree survives for the second agent.
+  # Intentionally no `git worktree remove` here.
+
+  return $pipeline
 }
 
 function Split-Patch {
@@ -2816,6 +3659,426 @@ function Wait-GitSplitPullRequestChecks {
   }
 
   return "$Repository#$PullRequest"
+}
+
+# ---------------------------------------------------------------------------
+# gh / gh stack / gh api runners and PR/stack machinery
+#
+# These are the gh-side seam: all GitHub CLI calls in the under-stack flow
+# route through Invoke-GhCommand / Invoke-StackCommand / Invoke-GhApi (never a
+# bare `& gh`), mirroring how git calls route through Invoke-Git/Invoke-GitQuery.
+# Tests mock these via `Mock -ModuleName GitSplit` (symmetric with Invoke-GitQuery)
+# or by shadowing the `gh` binary with a global function.
+# ---------------------------------------------------------------------------
+
+function Invoke-GhCommand {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    [Parameter()]
+    [switch]$AllowFailure,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args
+  )
+
+  $records = @(
+    & gh @Args 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+        }
+      }
+  )
+
+  $exitCode = $LASTEXITCODE
+  $output = ($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+
+  if ($exitCode -ne 0 -and -not $AllowFailure) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "gh $($Args -join ' ')" }
+    if ([string]::IsNullOrWhiteSpace($output)) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+    throw "$ctx failed with exit code $exitCode`n$output"
+  }
+
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    Output   = $output
+    Lines    = $records
+  }
+}
+
+function Invoke-StackCommand {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    [Parameter()]
+    [switch]$AllowFailure,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args
+  )
+
+  # `gh stack` is a subcommand, so prepend 'stack' to the args.
+  $fullArgs = @('stack') + $Args
+  $records = @(
+    & gh @fullArgs 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+        }
+      }
+  )
+
+  $exitCode = $LASTEXITCODE
+  $output = ($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+
+  if ($exitCode -ne 0 -and -not $AllowFailure) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "gh $($fullArgs -join ' ')" }
+    if ([string]::IsNullOrWhiteSpace($output)) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+    throw "$ctx failed with exit code $exitCode`n$output"
+  }
+
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    Output   = $output
+    Lines    = $records
+  }
+}
+
+function Invoke-GhApi {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    [Parameter()]
+    [switch]$AllowFailure,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args
+  )
+
+  # Inject the hawkins-preview Accept header for the stacks API.
+  $fullArgs = @('-H', 'Accept: application/vnd.github.hawkins-preview+json', 'api') + $Args
+  $records = @(
+    & gh @fullArgs 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+        }
+      }
+  )
+
+  $exitCode = $LASTEXITCODE
+  $output = ($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+
+  if ($exitCode -ne 0 -and -not $AllowFailure) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "gh $($fullArgs -join ' ')" }
+    if ([string]::IsNullOrWhiteSpace($output)) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+    throw "$ctx failed with exit code $exitCode`n$output"
+  }
+
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    Output   = $output
+    Lines    = $records
+  }
+}
+
+function Resolve-GitSplitPullRequestFromBranch {
+  <#
+  .SYNOPSIS
+  Resolves an open pull request from a head branch name via `gh pr view --json`.
+
+  .OUTPUTS
+  A PSCustomObject (number/baseRefName/headRefName/isDraft/state) when an open PR
+  exists for the branch, or $null when none exists.
+  #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Branch
+  )
+
+  $result = Invoke-GhCommand -AllowFailure -Args @('pr', 'view', '--head', $Branch, '--json', 'number,baseRefName,headRefName,isDraft,state')
+  if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
+    return $null
+  }
+
+  try {
+    return $result.Output | ConvertFrom-Json
+  }
+  catch {
+    return $null
+  }
+}
+
+function Resolve-GitSplitRemoteRepo {
+  <#
+  .SYNOPSIS
+  Resolves the `owner/repo` slug of the current repository via `gh repo view`.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $result = Invoke-GhCommand -Args @('repo', 'view', '--json', 'nameWithOwner')
+  if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
+    throw "Failed to resolve the GitHub repository slug. Is this a GitHub repo with gh authed?"
+  }
+
+  try {
+    $obj = $result.Output | ConvertFrom-Json
+    return $obj.nameWithOwner
+  }
+  catch {
+    throw "Failed to parse `gh repo view` output: $($_.Exception.Message)"
+  }
+}
+
+function Find-GitSplitStaleStacks {
+  <#
+  .SYNOPSIS
+  Finds GitHub-native stacks whose pull_requests include a given source PR number.
+
+  .DESCRIPTION
+  Queries `repos/<owner>/<repo>/stacks` (hawkins-preview). Returns the stack
+  numbers (integers) of any stack whose pull_requests collection contains the
+  source PR number. Used by the under-stack flow to free a source PR from a
+  stale stack that blocks `gh pr edit --base`.
+  #>
+  [CmdletBinding()]
+  [OutputType([int[]])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [int]$SourcePRNumber
+  )
+
+  $repo = Resolve-GitSplitRemoteRepo
+  $result = Invoke-GhApi -Args @("repos/$repo/stacks")
+  if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
+    return @()
+  }
+
+  try {
+    $stacks = $result.Output | ConvertFrom-Json
+  }
+  catch {
+    return @()
+  }
+
+  $stale = @()
+  foreach ($stack in $stacks) {
+    $prs = @($stack.pull_requests)
+    foreach ($pr in $prs) {
+      if ([int]$pr.number -eq $SourcePRNumber) {
+        $stale += [int]$stack.number
+        break
+      }
+    }
+  }
+  return [int[]]$stale
+}
+
+function New-GitStackProvider {
+  <#
+  .SYNOPSIS
+  Factory for a stack provider that knows how to register/unstack stacks.
+
+  .DESCRIPTION
+  Returns a PSCustomObject with scriptblock methods:
+    Register(-LowerPRNumber, -SourcePRNumber)
+    Unstack(-StackNumber)
+    Restack()
+  - gh-stack  : Register issues `gh stack link <lowerPR> <sourcePR>` (PR numbers,
+                no push side-effect). Unstack issues `gh stack unstack <n>`.
+  - graphite  : Register issues `gt submit`. Unstack is a no-op (Graphite has no
+                direct unstack; the stack relationship is recomputed on submit).
+  - none      : Register is a no-op (no stack registration). Unstack is a no-op.
+  - auto      : detects the installed provider (prefers gh-stack, then graphite,
+                else none).
+  GitSplit owns PR-create + base-repoint + push; the provider owns ONLY stack
+  registration. The provider restack is NOT called in the default (repoint-only)
+  path — it is real git rebase and would contradict the non-destructive default.
+  #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('gh-stack', 'graphite', 'none', 'auto')]
+    [string]$Provider
+  )
+
+  $resolved = $Provider
+  if ($Provider -eq 'auto') {
+    if ($null -ne (Get-Command gh -ErrorAction SilentlyContinue) -and
+        (& gh extension list 2>$null | Select-String -Quiet 'gh-stack')) {
+      $resolved = 'gh-stack'
+    }
+    elseif ($null -ne (Get-Command gt -ErrorAction SilentlyContinue)) {
+      $resolved = 'graphite'
+    }
+    else {
+      $resolved = 'none'
+    }
+  }
+
+  switch ($resolved) {
+    'gh-stack' {
+      return [pscustomobject]@{
+        Provider = 'gh-stack'
+        Register = {
+          param([int]$LowerPRNumber, [int]$SourcePRNumber)
+          Invoke-StackCommand -Args @('link', "$LowerPRNumber", "$SourcePRNumber") | Out-Null
+        }
+        Unstack = {
+          param([int]$StackNumber)
+          Invoke-StackCommand -Args @('unstack', "$StackNumber") | Out-Null
+        }
+        Restack = {
+          # Not used in the default (repoint-only) path. Provided for completeness.
+          Invoke-StackCommand -Args @('rebase') | Out-Null
+        }
+      }
+    }
+    'graphite' {
+      return [pscustomobject]@{
+        Provider = 'graphite'
+        Register = {
+          param([int]$LowerPRNumber, [int]$SourcePRNumber)
+          # Graphite recomputes stack relationships from branch bases on submit.
+          Invoke-GtCommand -Args @('submit', '--stack', '--no-interactive') | Out-Null
+        }
+        Unstack = {
+          param([int]$StackNumber)
+          # Graphite has no direct unstack; a no-op is the safe default.
+        }
+        Restack = {
+          Invoke-GtCommand -Args @('restack') | Out-Null
+        }
+      }
+    }
+    'none' {
+      return [pscustomobject]@{
+        Provider = 'none'
+        Register = {
+          param([int]$LowerPRNumber, [int]$SourcePRNumber)
+          # No stack registration requested.
+        }
+        Unstack = {
+          param([int]$StackNumber)
+          # No-op.
+        }
+        Restack = {
+          # No-op.
+        }
+      }
+    }
+  }
+}
+
+function Invoke-GtCommand {
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter()]
+    [string]$ErrorMessage,
+
+    [Parameter()]
+    [switch]$AllowFailure,
+
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [string[]]$Args
+  )
+
+  $records = @(
+    & gt @Args 2>&1 |
+      ForEach-Object {
+        if ($null -ne $_) {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+        }
+      }
+  )
+
+  $exitCode = $LASTEXITCODE
+  $output = ($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
+
+  if ($exitCode -ne 0 -and -not $AllowFailure) {
+    $ctx = if ($ErrorMessage) { $ErrorMessage } else { "gt $($Args -join ' ')" }
+    if ([string]::IsNullOrWhiteSpace($output)) {
+      throw "$ctx failed with exit code $exitCode"
+    }
+    throw "$ctx failed with exit code $exitCode`n$output"
+  }
+
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    Output   = $output
+    Lines    = $records
+  }
+}
+
+function New-FakeGitStackProvider {
+  <#
+  .SYNOPSIS
+  A test-injection stack provider that records calls and returns canned results.
+
+  .DESCRIPTION
+  Follows the Set-GitSplitTestHooks pattern: tests inject this to assert
+  orchestration behavior without touching gh. Exposes a Calls ArrayList of
+  @{ Operation; LowerPRNumber; SourcePRNumber; StackNumber } records.
+  #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param()
+
+  $calls = [System.Collections.ArrayList]@()
+
+  # GetNewClosure() captures $calls so the scriptblocks can mutate it when
+  # invoked outside this function's scope (they are stored on the returned object).
+  $register = {
+    param([int]$LowerPRNumber, [int]$SourcePRNumber)
+    $null = $calls.Add([pscustomobject]@{
+      Operation      = 'Register'
+      LowerPRNumber  = $LowerPRNumber
+      SourcePRNumber = $SourcePRNumber
+    })
+  }.GetNewClosure()
+
+  $unstack = {
+    param([int]$StackNumber)
+    $null = $calls.Add([pscustomobject]@{
+      Operation   = 'Unstack'
+      StackNumber = $StackNumber
+    })
+  }.GetNewClosure()
+
+  $restack = {
+    $null = $calls.Add([pscustomobject]@{ Operation = 'Restack' })
+  }.GetNewClosure()
+
+  return [pscustomobject]@{
+    Provider = 'fake'
+    Calls    = $calls
+    Register = $register
+    Unstack  = $unstack
+    Restack  = $restack
+  }
 }
 
 function New-SplitCommitPlan {
@@ -4489,14 +5752,15 @@ function Move-Commit {
   This command can rewrite history when -RemoveFromSource is specified.
   Prefer using on local/unpublished branches (or be prepared to force push).
   #>
-  [CmdletBinding(SupportsShouldProcess = $true)]
+  [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Move')]
   [OutputType([string])]
   param(
-    [Parameter(Position = 0)]
+    [Parameter(Position = 0, ParameterSetName = 'Move')]
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
     [ValidatePattern("^HEAD(~\d+)?$|^[0-9a-f]{7,40}$")]
     [string]$CommitRef = "HEAD",
 
-    [Parameter(Position = 1, Mandatory = $true)]
+    [Parameter(Position = 1, Mandatory = $true, ParameterSetName = 'Move')]
     [ValidateNotNullOrEmpty()]
     [string]$DestinationBranch,
 
@@ -4518,10 +5782,70 @@ function Move-Commit {
     [Parameter()]
     [string]$BaseRef,
 
-    [Parameter()]
+    # --- UnderPRInStack parameter set ---
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'UnderPRInStack')]
+    [ValidateNotNullOrEmpty()]
+    [string]$WorktreePath,
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [int]$SourcePR,
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [ValidateSet('gh-stack', 'graphite', 'none', 'auto')]
+    [string]$StackProvider = 'auto',
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [ValidateSet('draft', 'ready')]
+    [string]$DraftState = 'draft',
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [string]$Title,
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [string]$Body,
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [switch]$RollbackOnFailure,
+
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [switch]$DryRun,
+
+    [Parameter(ParameterSetName = 'Move')]
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
+    [switch]$UnderPRInStack,
+
+    [Parameter(ParameterSetName = 'Move')]
+    [Parameter(ParameterSetName = 'UnderPRInStack')]
     [ValidateNotNullOrEmpty()]
     [string]$OutputScriptPath
   )
+
+  if ($PSCmdlet.ParameterSetName -eq 'UnderPRInStack') {
+    $underPlan = New-MoveCommitUnderPRPlan `
+      -WorktreePath $WorktreePath `
+      -CommitRef $CommitRef `
+      -SourcePR $SourcePR `
+      -StackProvider $StackProvider `
+      -DraftState $DraftState `
+      -Title $Title `
+      -Body $Body `
+      -RollbackOnFailure:$RollbackOnFailure `
+      -DryRun:$DryRun
+
+    if ($OutputScriptPath) {
+      if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Move-Commit -UnderPRInStack execution script')) {
+        return Write-PipelineScript -Pipeline $underPlan -Path $OutputScriptPath
+      }
+      return
+    }
+
+    $action = "Stack commit $($underPlan.Metadata.CommitHash) under PR $($underPlan.Metadata.SourcePRNumber) into a new lower branch"
+    if ($PSCmdlet.ShouldProcess($WorktreePath, $action)) {
+      return Invoke-Pipeline -Pipeline $underPlan
+    }
+    return
+  }
 
   $plan = New-MoveCommitPlan `
     -CommitRef $CommitRef `
