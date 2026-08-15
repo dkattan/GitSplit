@@ -5598,4 +5598,804 @@ jobs:
       { Test-GitCommitIsAncestor -Ancestor 'abc123' -Descendant 'def456' } | Should -Throw '*Failed to determine*'
     }
   }
+
+  Describe "Pipeline recorder op model" {
+    BeforeAll {
+      # The recorder builders/functions are internal to the module. Tests run
+      # against the public exports (no InModuleScope), so reach the internals
+      # via the module's exported helpers where possible; the recorder ops are
+      # plain PSCustomObjects, asserted by value.
+    }
+
+    It "New-PipelineOp constructs a node with all fields and sane defaults" {
+      $op = New-PipelineOp -Kind 'Git' -Args @('rev-parse', 'HEAD')
+      $op.Kind | Should -Be 'Git'
+      $op.Args | Should -Be @('rev-parse', 'HEAD')
+      $op.WorkingDir | Should -BeNullOrEmpty
+      $op.OnFailure | Should -BeNullOrEmpty
+      $op.Down | Should -BeNullOrEmpty
+      $op.When | Should -BeNullOrEmpty
+      $op.Label | Should -BeNullOrEmpty
+      $op.CaptureResult | Should -BeNullOrEmpty
+    }
+
+    It "New-PipelineOp accepts optional fields" {
+      $down = New-PipelineOp -Kind 'Git' -Args @('push', '-d', 'origin', 'lower')
+      $op = New-PipelineOp -Kind 'Git' -Args @('push', '-u', 'origin', 'lower') -Down $down -When '$true' -Label 'push-lower'
+      $op.Down.Args | Should -Be @('push', '-d', 'origin', 'lower')
+      $op.When | Should -Be '$true'
+      $op.Label | Should -Be 'push-lower'
+    }
+
+    It "New-Pipeline stores metadata and steps" {
+      $pipeline = New-Pipeline -Metadata @{ SourceBranch = 'feature' } -Steps @()
+      $pipeline.Name | Should -Be 'Pipeline'
+      $pipeline.Metadata.SourceBranch | Should -Be 'feature'
+      $pipeline.Steps | Should -Be @()
+      $pipeline.Finally | Should -BeNullOrEmpty
+    }
+
+    It "Add-PipelineOp appends an op and returns the pipeline" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      $op = New-PipelineOp -Kind 'Git' -Args @('status')
+      $result = Add-PipelineOp -Pipeline $pipeline -Op $op
+      $pipeline.Steps.Count | Should -Be 1
+      $pipeline.Steps[0].Args | Should -Be @('status')
+      $result | Should -Be $pipeline
+    }
+
+    It "Set-PipelineFinally records a finally op list" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      $finalOp = New-PipelineOp -Kind 'Git' -Args @('worktree', 'list')
+      Set-PipelineFinally -Pipeline $pipeline -Ops @($finalOp) | Out-Null
+      $pipeline.Finally.Count | Should -Be 1
+      $pipeline.Finally[0].Args | Should -Be @('worktree', 'list')
+    }
+  }
+
+  Describe "Pipeline recorder builders do not execute" {
+    It "Invoke-GitOp appends a Git op node without shelling out" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      # Mock the git seam to prove it is NEVER called by the builder.
+      Mock Invoke-GitQuery -ModuleName GitSplit { throw 'Invoke-GitQuery must not be called by a builder' }
+
+      Invoke-GitOp -Pipeline $pipeline -Args @('rev-parse', 'HEAD') | Out-Null
+
+      $pipeline.Steps.Count | Should -Be 1
+      $pipeline.Steps[0].Kind | Should -Be 'Git'
+      $pipeline.Steps[0].Args | Should -Be @('rev-parse', 'HEAD')
+      Should -Not -Invoke Invoke-GitQuery -ModuleName GitSplit
+    }
+
+    It "Invoke-GhOp appends a Gh op node (builders only append, never execute)" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'view', '--json', 'number') | Out-Null
+
+      # A builder only records; it must not attempt to dispatch (the gh runner
+      # does not exist yet at this layer, and would only be called by the live
+      # interpreter, never by the builder).
+      $pipeline.Steps.Count | Should -Be 1
+      $pipeline.Steps[0].Kind | Should -Be 'Gh'
+      $pipeline.Steps[0].Args | Should -Be @('pr', 'view', '--json', 'number')
+    }
+
+    It "Invoke-StackOp appends a Stack op node (builders only append)" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+
+      Invoke-StackOp -Pipeline $pipeline -Args @('link', '12', '34') | Out-Null
+
+      $pipeline.Steps.Count | Should -Be 1
+      $pipeline.Steps[0].Kind | Should -Be 'Stack'
+      $pipeline.Steps[0].Args | Should -Be @('link', '12', '34')
+    }
+
+    It "Invoke-GhApiOp appends an Api op node (builders only append)" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+
+      Invoke-GhApiOp -Pipeline $pipeline -Args @('repos/owner/repo/stacks') | Out-Null
+
+      $pipeline.Steps.Count | Should -Be 1
+      $pipeline.Steps[0].Kind | Should -Be 'Api'
+      $pipeline.Steps[0].Args | Should -Be @('repos/owner/repo/stacks')
+    }
+  }
+
+  Describe "Pipeline serializer (ConvertTo-PipelineScript)" {
+    It "emits the standard preamble and a serialized Git op" {
+      $pipeline = New-Pipeline -Metadata @{ Name = 'Move-Commit' } -Steps @()
+      Invoke-GitOp -Pipeline $pipeline -Args @('rev-parse', 'HEAD') -Label 'resolve-head' | Out-Null
+
+      $script = ConvertTo-PipelineScript -Pipeline $pipeline
+
+      $script | Should -Match ([regex]::Escape('# Generated by GitSplit: Pipeline'))
+      $script | Should -Match ([regex]::Escape('Set-StrictMode -Version Latest'))
+      $script | Should -Match ([regex]::Escape("$ErrorActionPreference = 'Stop'"))
+      # The git op renders as an invocation of git with the args, string-literal escaped.
+      $script | Should -Match 'git'
+      $script | Should -Match ([regex]::Escape('rev-parse'))
+    }
+
+    It "renders a Down (undo) companion as a rollback comment" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      $down = New-PipelineOp -Kind 'Gh' -Args @('pr', 'close', '$runtime:lowerPRNumber')
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'create', '--draft') -Down $down | Out-Null
+
+      $script = ConvertTo-PipelineScript -Pipeline $pipeline
+
+      # The Down must appear as a documented rollback command (args string-literal escaped).
+      $script | Should -Match ([regex]::Escape("# Rollback (Down): gh 'pr' 'close'"))
+    }
+
+    It "renders a When conditional as an if guard" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      Invoke-GitOp -Pipeline $pipeline -Args @('push', '-u', 'origin', 'lower') -When '$shouldPush' | Out-Null
+
+      $script = ConvertTo-PipelineScript -Pipeline $pipeline
+
+      $script | Should -Match ([regex]::Escape('if ($shouldPush)'))
+    }
+  }
+
+  Describe "Pipeline live interpreter (Invoke-Pipeline)" {
+    It "runs a Git op by dispatching to the git seam and returns success" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      Invoke-GitOp -Pipeline $pipeline -Args @('rev-parse', 'HEAD') | Out-Null
+
+      Mock Invoke-GitQuery -ModuleName GitSplit {
+        [PSCustomObject]@{ ExitCode = 0; Output = 'abc123'; Lines = @('abc123') }
+      } -ParameterFilter { ($GitArgs -join ' ') -eq 'rev-parse HEAD' }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+
+      $result.Success | Should -Be $true
+      Should -Invoke Invoke-GitQuery -ModuleName GitSplit -Times 1
+    }
+
+    It "fires OnFailure and records failure when a Git op exits non-zero" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      $onFailure = New-PipelineOp -Kind 'Git' -Args @('status')
+      Invoke-GitOp -Pipeline $pipeline -Args @('cherry-pick', 'deadbeef') -OnFailure @($onFailure) | Out-Null
+
+      Mock Invoke-GitQuery -ModuleName GitSplit {
+        [PSCustomObject]@{ ExitCode = 1; Output = 'conflict'; Lines = @('conflict') }
+      }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+
+      $result.Success | Should -Be $false
+      # OnFailure should have run (git status dispatched).
+      Should -Invoke Invoke-GitQuery -ModuleName GitSplit -Times 2
+    }
+
+    It "skips an op whose When condition is false" {
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      Invoke-GitOp -Pipeline $pipeline -Args @('push', 'origin', 'lower') -When '$false' | Out-Null
+
+      Mock Invoke-GitQuery -ModuleName GitSplit { throw 'must not run when When is false' }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+      $result.Success | Should -Be $true
+      Should -Not -Invoke Invoke-GitQuery -ModuleName GitSplit
+    }
+
+    It "captures a number from op output and expands runtime tokens in a later op" {
+      # Exercise the capture + $runtime: expansion mechanism against the existing
+      # git seam (capture is mechanism-generic: it parses output for a number).
+      # The gh-PR-number-specific variant lives in the gh machinery tests.
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      # Step A: a git op whose output contains a /pull/42 URL — capture the 42.
+      Invoke-GitOp -Pipeline $pipeline -Args @('some-cmd') -CaptureResult @{ Type = 'PRNumber'; Variable = 'lowerPRNumber' } | Out-Null
+      # Step B: a later op referencing the captured number via a $runtime: token.
+      Invoke-GitOp -Pipeline $pipeline -Args @('view', '$runtime:lowerPRNumber') | Out-Null
+
+      $script:call = 0
+      $script:secondArgs = $null
+      Mock Invoke-GitQuery -ModuleName GitSplit {
+        $script:call++
+        if ($script:call -eq 1) {
+          [PSCustomObject]@{ ExitCode = 0; Output = 'https://github.com/owner/repo/pull/42'; Lines = @('https://github.com/owner/repo/pull/42') }
+        }
+        else {
+          $script:secondArgs = $GitArgs
+          [PSCustomObject]@{ ExitCode = 0; Output = ''; Lines = @() }
+        }
+      }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+
+      $result.Success | Should -Be $true
+      # The token must have been expanded to the captured number (42), not left literal.
+      $script:secondArgs -contains '42' | Should -Be $true
+      $script:secondArgs -contains '$runtime:lowerPRNumber' | Should -Be $false
+    }
+  }
+
+  Describe "Pipeline record-vs-execute parity" {
+    It "a recorded script and the live interpreter produce the same git invocation for a trivial pipeline" {
+      # Build a one-op pipeline.
+      $pipeline = New-Pipeline -Metadata @{} -Steps @()
+      Invoke-GitOp -Pipeline $pipeline -Args @('rev-parse', 'HEAD') | Out-Null
+
+      # Serialize it.
+      $script = ConvertTo-PipelineScript -Pipeline $pipeline
+      $script | Should -Not -BeNullOrEmpty
+
+      # The script must contain the same args the live interpreter would dispatch.
+      $script | Should -Match ([regex]::Escape('rev-parse'))
+      $script | Should -Match ([regex]::Escape('HEAD'))
+    }
+  }
+
+  Describe "gh command runners" {
+    BeforeAll {
+      # The runners shell out to gh/gh stack/gh api. In tests we shadow the
+      # `gh` binary with a global function (the existing Wait-GitSplitPullRequestChecks
+      # test pattern at line 528) so the runners' real dispatch is exercised.
+    }
+
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+      Remove-Variable -Name capturedGhArgs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It "Invoke-GhCommand returns the ExitCode/Output/Lines shape mirroring Invoke-GitQuery" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        # Simulate `gh pr view --json` printing JSON.
+        '{"number":42}'
+        $global:LASTEXITCODE = 0
+      }
+
+      $result = Invoke-GhCommand -Args @('pr', 'view', '--head', 'feature', '--json', 'number')
+
+      $result.ExitCode | Should -Be 0
+      $result.Output | Should -Match 'number'
+      $result.Lines | Should -Not -BeNullOrEmpty
+      $global:capturedGhArgs | Should -Be @('pr', 'view', '--head', 'feature', '--json', 'number')
+    }
+
+    It "Invoke-StackCommand dispatches to 'gh stack' and returns the result shape" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        'linked'
+        $global:LASTEXITCODE = 0
+      }
+
+      # Caller passes the subcommand args WITHOUT 'stack'; the runner prepends it.
+      $result = Invoke-StackCommand -Args @('link', '11', '22')
+
+      $result.ExitCode | Should -Be 0
+      $result.Output | Should -Be 'linked'
+      # The runner prepends 'stack' so the full invocation is `gh stack link 11 22`.
+      $global:capturedGhArgs | Should -Be @('stack', 'link', '11', '22')
+    }
+
+    It "Invoke-GhApi passes the preview header and returns the result shape" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        '[]'
+        $global:LASTEXITCODE = 0
+      }
+
+      $result = Invoke-GhApi -Args @('repos/owner/repo/stacks')
+
+      $result.ExitCode | Should -Be 0
+      # The runner must inject the hawkins-preview Accept header for the stacks API.
+      ($global:capturedGhArgs -join ' ') | Should -Match 'api'
+      ($global:capturedGhArgs -join ' ') | Should -Match ([regex]::Escape('application/vnd.github.hawkins-preview+json'))
+    }
+
+    It "Invoke-GhCommand does not throw when AllowFailure is set and exit code is non-zero" {
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        Write-Output 'no pull requests found'
+        $global:LASTEXITCODE = 1
+      }
+
+      $result = Invoke-GhCommand -AllowFailure -Args @('pr', 'view', '--head', 'nope', '--json', 'number')
+
+      $result.ExitCode | Should -Be 1
+      $result.Output | Should -Match 'no pull requests'
+    }
+  }
+
+  Describe "Resolve-GitSplitPullRequestFromBranch" {
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+    }
+
+    It "returns the PR object for a branch with an open PR" {
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        '{"number":99,"baseRefName":"main","headRefName":"feature","isDraft":false,"state":"OPEN"}'
+        $global:LASTEXITCODE = 0
+      }
+
+      $pr = Resolve-GitSplitPullRequestFromBranch -Branch 'feature'
+
+      $pr | Should -Not -BeNullOrEmpty
+      $pr.number | Should -Be 99
+      $pr.baseRefName | Should -Be 'main'
+      $pr.state | Should -Be 'OPEN'
+    }
+
+    It "returns null when no PR exists for the branch (gh exits non-zero)" {
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        Write-Output 'no pull requests found'
+        $global:LASTEXITCODE = 1
+      }
+
+      $pr = Resolve-GitSplitPullRequestFromBranch -Branch 'no-pr-branch'
+
+      $pr | Should -BeNullOrEmpty
+    }
+  }
+
+  Describe "Find-GitSplitStaleStacks" {
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+    }
+
+    It "returns only stacks whose pull_requests include the source PR" {
+      # The GitHub stacks API returns a JSON array of stack objects.
+      $stacksJson = @(
+        '['
+        '{"number":500,"pull_requests":[{"number":100},{"number":101}]}'   # Stack A: includes PR 100
+        ',{"number":501,"pull_requests":[{"number":200},{"number":201}]}'  # Stack B: does not include PR 100
+        ',{"number":502,"pull_requests":[{"number":100},{"number":300}]}'  # Stack C: includes PR 100
+        ']'
+      ) -join ''
+
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        # Branch on subcommand: `repo view` -> nameWithOwner JSON; `api` -> stacks JSON.
+        # Note: 'repos/.../stacks' also contains 'repo', so branch on 'view'/'api'.
+        if ($Arguments -contains 'view') {
+          '{"nameWithOwner":"owner/repo"}'
+        }
+        else {
+          $stacksJson
+        }
+        $global:LASTEXITCODE = 0
+      }
+
+      $stale = Find-GitSplitStaleStacks -SourcePRNumber 100
+
+      $stale | Should -Not -BeNullOrEmpty
+      $stale.Count | Should -Be 2
+      ($stale | ForEach-Object { $_ }) -contains 500 | Should -Be $true
+      ($stale | ForEach-Object { $_ }) -contains 502 | Should -Be $true
+    }
+
+    It "returns empty when no stacks reference the source PR" {
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        if ($Arguments -contains 'view') {
+          '{"nameWithOwner":"owner/repo"}'
+        }
+        else {
+          '{"number":501,"pull_requests":[{"number":200},{"number":201}]}'
+        }
+        $global:LASTEXITCODE = 0
+      }
+
+      $stale = Find-GitSplitStaleStacks -SourcePRNumber 100
+
+      $stale | Should -BeNullOrEmpty
+    }
+  }
+
+  Describe "New-GitStackProvider" {
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+    }
+
+    It "gh-stack Register issues 'gh stack link lowerPR sourcePR' (PR numbers, no push)" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        'linked'
+        $global:LASTEXITCODE = 0
+      }
+
+      $provider = New-GitStackProvider -Provider 'gh-stack'
+      & $provider.Register -LowerPRNumber 11 -SourcePRNumber 22
+
+      $global:capturedGhArgs | Should -Be @('stack', 'link', '11', '22')
+    }
+
+    It "none Register is a no-op (issues no gh command)" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        $global:LASTEXITCODE = 0
+      }
+
+      $provider = New-GitStackProvider -Provider 'none'
+      & $provider.Register -LowerPRNumber 11 -SourcePRNumber 22 | Out-Null
+
+      $global:capturedGhArgs | Should -BeNullOrEmpty
+    }
+
+    It "Unstack issues 'gh stack unstack n'" {
+      $global:capturedGhArgs = @()
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:capturedGhArgs = $Arguments
+        'unstacked'
+        $global:LASTEXITCODE = 0
+      }
+
+      $provider = New-GitStackProvider -Provider 'gh-stack'
+      & $provider.Unstack -StackNumber 500
+
+      $global:capturedGhArgs | Should -Be @('stack', 'unstack', '500')
+    }
+  }
+
+  Describe "New-FakeGitStackProvider" {
+    It "records Register/Unstack calls and returns canned results" {
+      $fake = New-FakeGitStackProvider
+
+      & $fake.Register -LowerPRNumber 11 -SourcePRNumber 22 | Out-Null
+      & $fake.Unstack -StackNumber 500 | Out-Null
+
+      $fake.Calls.Count | Should -Be 2
+      $fake.Calls[0].Operation | Should -Be 'Register'
+      $fake.Calls[0].LowerPRNumber | Should -Be 11
+      $fake.Calls[0].SourcePRNumber | Should -Be 22
+      $fake.Calls[1].Operation | Should -Be 'Unstack'
+      $fake.Calls[1].StackNumber | Should -Be 500
+    }
+  }
+
+  Describe "Move-Commit -UnderPRInStack parameter set" {
+    BeforeAll {
+      # Suppress the gh binary requirement at discovery; these tests shadow gh per-It.
+    }
+
+    It "resolves to the UnderPRInStack parameter set when -WorktreePath is supplied" {
+      # Assert parameter-set BINDING, not successful execution. With -UnderPRInStack and
+      # -WorktreePath, binding succeeds and discovery runs; outside a repo with an open PR,
+      # discovery throws the 'no open PR' error (proving we reached the UnderPRInStack path,
+      # not a parameter-binding error). A binding failure would mention a missing parameter.
+      try {
+        Move-Commit -UnderPRInStack -WorktreePath (Join-Path $script:TempRepoPath 'wt-x') -WhatIf -ErrorAction Stop
+        throw 'EXPECTED-DISCOVERY-ERROR'
+      }
+      catch {
+        $_.Exception.Message | Should -Match 'open pull request|EXPECTED-DISCOVERY-ERROR'
+        $_.Exception.Message | Should -Not -Match 'missing|parameter|Mandatory'
+      }
+    }
+
+    It "requires -WorktreePath in the UnderPRInStack set" {
+      { Move-Commit -UnderPRInStack -WhatIf } | Should -Throw
+    }
+
+    It "existing Move calls (no -UnderPRInStack) still bind to the Move set (regression)" {
+      # A Move call missing -DestinationBranch must still error on DestinationBranch, proving
+      # the default parameter set is still 'Move' (not UnderPRInStack).
+      { Move-Commit -CommitRef HEAD -WhatIf } | Should -Throw
+    }
+  }
+
+  Describe "Move-Commit -UnderPRInStack plan builder" {
+    BeforeEach {
+      # These tests shadow gh so the builder's discovery (gh pr view / gh repo view / stacks)
+      # resolves canned data without a real GitHub. They build a plan and assert the RECORDED
+      # script, not live execution. The fresh-repo fixture's current branch is 'main', which we
+      # treat as the source branch with an open PR; any other --head (e.g. the lower branch)
+      # has no PR.
+      function global:gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        if ($Arguments -contains 'view' -and $Arguments -contains 'pr') {
+          # gh pr view --head <branch> --json ... : only 'main' has a PR.
+          $headIdx = [Array]::IndexOf($Arguments, '--head')
+          $headBranch = if ($headIdx -ge 0) { $Arguments[$headIdx + 1] } else { '' }
+          if ($headBranch -eq 'main') {
+            '{"number":777,"baseRefName":"main","headRefName":"main","isDraft":false,"state":"OPEN"}'
+            $global:LASTEXITCODE = 0
+          }
+          else {
+            Write-Output 'no pull requests found'
+            $global:LASTEXITCODE = 1
+          }
+        }
+        elseif ($Arguments -contains 'view') {
+          # gh repo view --json nameWithOwner
+          '{"nameWithOwner":"owner/repo"}'
+          $global:LASTEXITCODE = 0
+        }
+        elseif ($Arguments -contains 'api') {
+          # gh api repos/owner/repo/stacks : no stale stacks.
+          '[]'
+          $global:LASTEXITCODE = 0
+        }
+        else {
+          $global:LASTEXITCODE = 0
+        }
+      }
+    }
+
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+    }
+
+    It "builds a complete plan with only -WorktreePath (zero-extra-arg ergonomics)" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Make a commit to move (the source branch's HEAD).
+        'under-stack-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'Under-stack commit to move' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        # The builder derives the title from the commit message and the source PR from the
+        # branch, so only -WorktreePath (and CommitRef) is strictly required.
+        $built = New-MoveCommitUnderPRPlan -WorktreePath $wt -CommitRef 'HEAD'
+        $built | Should -Not -BeNullOrEmpty
+        $built.Name | Should -Be 'Move-Commit-UnderPRInStack'
+        $built.Metadata.SourcePRNumber | Should -Be 777
+        $built.Metadata.LowerBaseRef | Should -Be 'main'
+        $built.Metadata.Title | Should -Be 'Under-stack commit to move'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "the generated script contains NO 'worktree remove' (persistent worktree, D6)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd6-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D6 persistent worktree' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Not -Match ([regex]::Escape('worktree remove'))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+
+    It "the cherry-pick skip check uses patch-id --stable (idempotency, D8)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd8-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D8 patch-id idempotency' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Match ([regex]::Escape('patch-id --stable'))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+
+    It "records the gh stack link op with PR numbers (D4 provider)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd4-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D4 provider link' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -StackProvider 'gh-stack' -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        # The link command uses the lower PR (runtime-captured token) and the source PR (777).
+        # Serialized args are quoted, so match the actual command form, not just the label.
+        $scriptText | Should -Match ([regex]::Escape("gh stack 'link'"))
+        # The runtime token is serialized literally (expanded at execution time, not serialization).
+        $scriptText | Should -Match ([regex]::Escape('$runtime:lowerPRNumber'))
+        $scriptText | Should -Match ([regex]::Escape("'777'"))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+
+    It "records a draft PR create by default and ready when -DraftState ready (D7)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd7-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D7 draft state' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-draft-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+        $draftScript = Get-Content -Path $scriptPath -Raw
+        $draftScript | Should -Match ([regex]::Escape('--draft'))
+
+        $scriptPath2 = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-ready-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -DraftState 'ready' -OutputScriptPath $scriptPath2 | Out-Null
+        $readyScript = Get-Content -Path $scriptPath2 -Raw
+        $readyScript | Should -Not -Match ([regex]::Escape('--draft'))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+        if ($scriptPath2 -and (Test-Path $scriptPath2)) { Remove-Item $scriptPath2 -Force }
+      }
+    }
+
+    It "records the 3-way worktree detect-and-branch logic (D6)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd6-three-way' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D6 three way' | Out-Null
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-d6-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        # The worktree step must check whether the path is already a worktree (worktree list)
+        # and only `worktree add -b` when it is not (re-run resume enters instead).
+        $scriptText | Should -Match ([regex]::Escape('worktree list --porcelain'))
+        $scriptText | Should -Match ([regex]::Escape('worktree add -b'))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+
+    It "records unstack ops for stale stacks discovered at build time (D5)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd5-content' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D5 stale unstack' | Out-Null
+
+        # Override the api branch to return a stale stack referencing the source PR (777).
+        function global:gh {
+          param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+          if ($Arguments -contains 'view' -and $Arguments -contains 'pr') {
+            $headIdx = [Array]::IndexOf($Arguments, '--head')
+            $headBranch = if ($headIdx -ge 0) { $Arguments[$headIdx + 1] } else { '' }
+            if ($headBranch -eq 'main') {
+              '{"number":777,"baseRefName":"main","headRefName":"main","isDraft":false,"state":"OPEN"}'
+              $global:LASTEXITCODE = 0
+            }
+            else { Write-Output 'no pull requests found'; $global:LASTEXITCODE = 1 }
+          }
+          elseif ($Arguments -contains 'view') { '{"nameWithOwner":"owner/repo"}'; $global:LASTEXITCODE = 0 }
+          elseif ($Arguments -contains 'api') {
+            # A stale stack containing the source PR (777).
+            '[{"number":900,"pull_requests":[{"number":777},{"number":888}]}]'
+            $global:LASTEXITCODE = 0
+          }
+          else { $global:LASTEXITCODE = 0 }
+        }
+
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-d5-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        # The unstack op for stack 900 must be recorded BEFORE the repoint (gh pr edit --base).
+        # Args are string-literal escaped in the serialized script, so match the quoted form.
+        $scriptText | Should -Match ([regex]::Escape("gh stack 'unstack' '900'"))
+        $scriptText | Should -Match ([regex]::Escape("gh 'pr' 'edit'"))
+        # Unstack must precede the repoint in the script text.
+        $scriptText.IndexOf("gh stack 'unstack' '900'") | Should -BeLessThan $scriptText.IndexOf("gh 'pr' 'edit'")
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+
+    It "records no unstack ops when no stale stacks are discovered (D5)" {
+      Push-Location $script:TempRepoPath
+      try {
+        'd5-none' | Add-Content -Path 'a.txt'
+        git add a.txt | Out-Null
+        git commit -m 'D5 no stale' | Out-Null
+
+        # The shared BeforeEach shadow returns '[]' for api (no stale stacks).
+        $wt = Join-Path $script:TempRepoPath ('wt-' + (New-Guid))
+        $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ('under-pr-d5none-' + (New-Guid) + '.ps1')
+        Move-Commit -UnderPRInStack -WorktreePath $wt -OutputScriptPath $scriptPath | Out-Null
+
+        $scriptText = Get-Content -Path $scriptPath -Raw
+        $scriptText | Should -Not -Match ([regex]::Escape('gh stack unstack'))
+      }
+      finally {
+        Pop-Location
+        if ($scriptPath -and (Test-Path $scriptPath)) { Remove-Item $scriptPath -Force }
+      }
+    }
+  }
+
+  Describe "Move-Commit -UnderPRInStack failure reporting and rollback (D8)" {
+    BeforeEach {
+      # These tests drive Invoke-Pipeline directly with a hand-built pipeline and mocked
+      # runners, to assert the D8 report/rollback behavior without live git/gh.
+    }
+
+    AfterEach {
+      Remove-Item Function:\gh -ErrorAction SilentlyContinue
+    }
+
+    It "on a failing step, reports failure and records Down commands for rollback" {
+      # Build a small pipeline: a succeeding op then a failing op, each with a Down.
+      $pipeline = New-Pipeline -Name 'D8-test' -Metadata @{} -Steps @()
+      $okDown = New-PipelineOp -Kind 'Gh' -Args @('pr', 'close', '11')
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'create', '--draft') -Down $okDown -CaptureResult @{ Type = 'PRNumber'; Variable = 'lowerPRNumber' } | Out-Null
+      $failDown = New-PipelineOp -Kind 'Gh' -Args @('pr', 'edit', '777', '--base', 'restore-me')
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'edit', '777', '--base', 'lower') -Down $failDown | Out-Null
+
+      # Mock the gh runner: the create succeeds (returns a PR URL), the edit fails.
+      $script:ghCall = 0
+      Mock Invoke-GhCommand -ModuleName GitSplit {
+        $script:ghCall++
+        if ($script:ghCall -eq 1) {
+          [PSCustomObject]@{ ExitCode = 0; Output = 'https://github.com/owner/repo/pull/11'; Lines = @('https://github.com/owner/repo/pull/11') }
+        }
+        else {
+          [PSCustomObject]@{ ExitCode = 1; Output = 'Cannot change the base branch because the pull request is part of a stack'; Lines = @() }
+        }
+      }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+
+      $result.Success | Should -Be $false
+      $result.FirstError.ExitCode | Should -Be 1
+      # The succeeded op's Down (close 11) must be recorded for rollback.
+      $result.DownCommands.Count | Should -BeGreaterOrEqual 1
+      ($result.DownCommands | ForEach-Object { $_.Args -join ' ' }) -join "`n" | Should -Match ([regex]::Escape('pr close 11'))
+    }
+
+    It "captures the PR number from the succeeding create step before the failure" {
+      $pipeline = New-Pipeline -Name 'D8-capture' -Metadata @{} -Steps @()
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'create', '--draft') -CaptureResult @{ Type = 'PRNumber'; Variable = 'lowerPRNumber' } | Out-Null
+      # A later op referencing the captured number (would run, but the create is the only op here).
+      Invoke-GhOp -Pipeline $pipeline -Args @('pr', 'view', '$runtime:lowerPRNumber') | Out-Null
+
+      $script:ghCall = 0
+      Mock Invoke-GhCommand -ModuleName GitSplit {
+        $script:ghCall++
+        if ($script:ghCall -eq 1) {
+          [PSCustomObject]@{ ExitCode = 0; Output = 'https://github.com/owner/repo/pull/42'; Lines = @() }
+        }
+        else {
+          [PSCustomObject]@{ ExitCode = 0; Output = '{"number":42}'; Lines = @() }
+        }
+      }
+
+      $result = Invoke-Pipeline -Pipeline $pipeline
+      $result.Success | Should -Be $true
+      # The captured number must be available in RuntimeVars.
+      $result.RuntimeVars['lowerPRNumber'] | Should -Be '42'
+    }
+  }
 }
